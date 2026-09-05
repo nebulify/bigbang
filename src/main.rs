@@ -81,6 +81,16 @@ enum RecipeOp {
         #[arg(long)]
         profile: PathBuf,
     },
+    /// Execute a recipe against the machines its roles select
+    Execute {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        profile: PathBuf,
+        /// Resolve and print the plan without running anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Install recipe files into the store
     Install {
         #[arg(long)]
@@ -112,6 +122,7 @@ fn run() -> Result<()> {
         Command::Recipe { operation } => match operation {
             RecipeOp::List { profile } => recipe_list(&profile),
             RecipeOp::Show { id, profile } => recipe_show(&id, &profile),
+            RecipeOp::Execute { id, profile, dry_run } => recipe_execute(&id, &profile, dry_run),
             RecipeOp::Install { source, profile, recursive, force } => {
                 recipe_install(&source, &profile, recursive, force)
             }
@@ -266,5 +277,101 @@ fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, 
     let password = vault_password()?;
     vault.add(item_id, type_, description, data, &password)?;
     println!("✓ Added vault item: {item_id}");
+    Ok(())
+}
+
+fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()> {
+    use bigbang::exec::{run_definition, SshExecutor};
+    use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
+    use bigbang::recipe::{resolve_all, Recipe};
+    use bigbang::task::TaskDefinition;
+
+    let profile = Profile::load(profile_path)?;
+    let store = RepoDb::new(
+        Profile::expand(&profile.bigbang_path),
+        &profile.account_code,
+        &profile.database_name,
+    );
+
+    let raw = store
+        .read_latest(TYPE_RECIPE, id)?
+        .with_context(|| format!("Recipe not found: {id}"))?;
+    let recipe: Recipe = serde_json::from_value(raw).context("parsing the recipe")?;
+
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║  Recipe Execution: {}", recipe.name);
+    println!("╚════════════════════════════════════════════════════════════╝");
+
+    let vault_root = Profile::expand(&profile.vault_path);
+    let password = || vault_password();
+    let recipe_vars = resolve_all(&recipe.variables, &vault_root, &password)?;
+    let instances = load_instances(&store)?;
+    let library_root = PathBuf::from(Profile::expand(&profile.library_path));
+
+    let mut failures = 0usize;
+    for role in &recipe.roles {
+        let targets = resolve_role_targets(
+            &instances,
+            &recipe.project_id,
+            role.infrastructure_ids.as_ref(),
+            role.selectors.as_ref(),
+        );
+        println!();
+        println!("── role '{}' → {} instance(s)", role.name, targets.len());
+        if targets.is_empty() {
+            println!("   (no instance matches; nothing to do)");
+            continue;
+        }
+
+        let role_vars = resolve_all(&role.variables, &vault_root, &password)?;
+        let mut merged = recipe_vars.clone();
+        merged.extend(role_vars);
+
+        let mut items: Vec<_> = role.items.iter().collect();
+        items.sort_by_key(|i| i.order.unwrap_or(0));
+
+        for instance in &targets {
+            println!("   ▸ {} ({})", instance.name, instance.address()?);
+            for item in &items {
+                let Some(coordinate) = item.package.as_ref().or(item.task.as_ref()) else {
+                    println!("     ⚠️  item has neither 'package' nor 'task'; skipped");
+                    continue;
+                };
+                let definition = TaskDefinition::load_from_library(&library_root, coordinate)
+                    .with_context(|| format!("loading {coordinate}"))?;
+
+                if dry_run {
+                    let count: usize = definition.tasks.iter().map(|t| t.commands.len()).sum();
+                    println!("     · {coordinate}: {} task(s), {count} command(s)", definition.tasks.len());
+                    continue;
+                }
+
+                let key_id = instance.ssh_key_id.as_deref()
+                    .with_context(|| format!("no sshKeyId on instance {}", instance.name))?;
+                let key = resolve_ssh_key(key_id, &vault_root, &password()?)?;
+                let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
+                let mut executor = SshExecutor { target, echo: true };
+
+                let outcomes = run_definition(&definition, &merged, &mut executor)?;
+                for outcome in &outcomes {
+                    if let Some(failure) = &outcome.failed {
+                        println!("     ✗ {}: {failure}", outcome.task_name);
+                        failures += 1;
+                    } else {
+                        println!("     ✓ {} ({} ran, {} skipped)", outcome.task_name, outcome.ran.len(), outcome.skipped.len());
+                    }
+                }
+                if failures > 0 && !item.continue_on_error {
+                    anyhow::bail!("Recipe execution failed in role '{}'", role.name);
+                }
+            }
+        }
+    }
+
+    if failures > 0 {
+        anyhow::bail!("Recipe execution failed: {failures} task(s)");
+    }
+    println!();
+    println!("✓ Recipe '{}' completed", recipe.name);
     Ok(())
 }

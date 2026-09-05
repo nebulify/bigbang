@@ -140,3 +140,129 @@ fn collect_json_files(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     out.sort();
     Ok(out)
 }
+
+// ── the recipe model, for execution ────────────────────────────────────────────
+
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Recipe {
+    pub id: String,
+    #[serde(rename = "projectId", default)]
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub roles: Vec<Role>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Role {
+    pub name: String,
+    #[serde(default)]
+    pub selectors: Option<Vec<String>>,
+    #[serde(rename = "infrastructureIds", default)]
+    pub infrastructure_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub variables: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub items: Vec<RoleItem>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RoleItem {
+    /// `group/name/version`, resolved against the library.
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub order: Option<i64>,
+    #[serde(rename = "continueOnError", default)]
+    pub continue_on_error: bool,
+}
+
+/// Resolve one variable value: `vault:account/project/id` decrypts, `file:path` reads, anything
+/// else is used as written.
+///
+/// A reference that cannot be resolved is an error, never an empty string — an unresolved password
+/// silently becoming `""` is a command that runs with the wrong credentials rather than failing.
+pub fn resolve_value(
+    value: &serde_json::Value,
+    vault_root: &str,
+    password: &dyn Fn() -> anyhow::Result<String>,
+) -> Result<String> {
+    let raw = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string().trim_matches('"').to_string(),
+    };
+
+    if let Some(reference) = raw.strip_prefix("vault:") {
+        let parts: Vec<&str> = reference.split('/').collect();
+        if parts.len() < 3 {
+            anyhow::bail!("vault reference must be account/project/id, got '{reference}'");
+        }
+        let pw = password()?;
+        let vault = crate::vault::Vault::new(
+            crate::profile::Profile::expand(vault_root),
+            parts[0],
+            parts[1],
+        );
+        let key = parts[2..].join("/");
+        return vault
+            .get(&key, &pw)?
+            .with_context(|| format!("Vault item not found: {key} in {}/{}", parts[0], parts[1]));
+    }
+
+    if let Some(path) = raw.strip_prefix("file:") {
+        let expanded = crate::profile::Profile::expand(path);
+        return fs::read_to_string(&expanded)
+            .with_context(|| format!("reading file reference {expanded}"));
+    }
+
+    Ok(raw)
+}
+
+pub fn resolve_all(
+    variables: &BTreeMap<String, serde_json::Value>,
+    vault_root: &str,
+    password: &dyn Fn() -> anyhow::Result<String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (key, value) in variables {
+        let resolved = resolve_value(value, vault_root, password)
+            .with_context(|| format!("resolving variable '{key}'"))?;
+        out.insert(key.clone(), resolved);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+
+    fn no_password() -> anyhow::Result<String> {
+        anyhow::bail!("should not be asked")
+    }
+
+    #[test]
+    fn a_plain_value_passes_through() {
+        let v = serde_json::json!("appdb");
+        assert_eq!(resolve_value(&v, "/vault", &no_password).unwrap(), "appdb");
+    }
+
+    #[test]
+    fn a_number_is_rendered_as_written() {
+        let v = serde_json::json!(5432);
+        assert_eq!(resolve_value(&v, "/vault", &no_password).unwrap(), "5432");
+    }
+
+    #[test]
+    fn a_malformed_vault_reference_is_an_error_not_an_empty_string() {
+        let v = serde_json::json!("vault:too/short");
+        assert!(resolve_value(&v, "/vault", &no_password).is_err());
+    }
+}
