@@ -56,8 +56,9 @@ enum LibraryOp {
     Install {
         #[arg(long)]
         source: PathBuf,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
         #[arg(long, short = 'r')]
         recursive: bool,
         #[arg(long, short = 'f')]
@@ -65,8 +66,9 @@ enum LibraryOp {
     },
     /// List everything in the library
     List {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
 }
 
@@ -74,13 +76,15 @@ enum LibraryOp {
 enum ProfileOp {
     /// Check a profile file is valid
     Validate {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
     /// Print a profile
     Show {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
 }
 
@@ -88,15 +92,17 @@ enum ProfileOp {
 enum VaultOp {
     /// List item names and types, without decrypting
     List {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
     /// Decrypt and print one item
     Get {
         #[arg(long = "item-id")]
         item_id: String,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
     /// Add an item to the vault
     Add {
@@ -108,8 +114,9 @@ enum VaultOp {
         type_: String,
         #[arg(long)]
         description: Option<String>,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
 }
 
@@ -117,22 +124,25 @@ enum VaultOp {
 enum RecipeOp {
     /// List every recipe in the store
     List {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
     /// Show one recipe as stored
     Show {
         #[arg(long)]
         id: String,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
     },
     /// Execute a recipe against the machines its roles select
     Execute {
         #[arg(long)]
         id: String,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
         /// Resolve and print the plan without running anything
         #[arg(long)]
         dry_run: bool,
@@ -141,8 +151,9 @@ enum RecipeOp {
     Install {
         #[arg(long)]
         source: PathBuf,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
-        profile: PathBuf,
+        profile: String,
         /// Recurse into sub-directories
         #[arg(long, short = 'r')]
         recursive: bool,
@@ -185,12 +196,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
         Command::Profile { operation } => match operation {
             ProfileOp::Validate { profile } => {
-                let p = Profile::load(&profile)?;
+                let p = Profile::open(&profile)?;
                 println!("✓ Profile '{}' is valid", p.name);
                 Ok(())
             }
             ProfileOp::Show { profile } => {
-                let p = Profile::load(&profile)?;
+                let p = Profile::open(&profile)?;
                 println!("{}", serde_json::to_string_pretty(&p)?);
                 Ok(())
             }
@@ -205,8 +216,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn open_vault(profile_path: &PathBuf) -> Result<Vault> {
-    let profile = Profile::load(profile_path)?;
+fn open_vault(profile_ref: &str) -> Result<Vault> {
+    let profile = Profile::open(profile_ref)?;
     Ok(Vault::new(
         Profile::expand(&profile.vault_path),
         &profile.account_code,
@@ -237,8 +248,8 @@ fn vault_password() -> Result<String> {
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
-fn vault_list(profile_path: &PathBuf) -> Result<()> {
-    let vault = open_vault(profile_path)?;
+fn vault_list(profile_ref: &str) -> Result<()> {
+    let vault = open_vault(profile_ref)?;
     let items = vault.list()?;
     if items.is_empty() {
         println!("No vault items found");
@@ -251,8 +262,8 @@ fn vault_list(profile_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn vault_get(item_id: &str, profile_path: &PathBuf) -> Result<()> {
-    let vault = open_vault(profile_path)?;
+fn vault_get(item_id: &str, profile_ref: &str) -> Result<()> {
+    let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
     match vault.get(item_id, &password)? {
         Some(value) => {
@@ -263,15 +274,15 @@ fn vault_get(item_id: &str, profile_path: &PathBuf) -> Result<()> {
     }
 }
 
-fn open_store(profile_path: &PathBuf) -> Result<(Profile, RepoDb)> {
-    let profile = Profile::load(profile_path)?;
+fn open_store(profile_ref: &str) -> Result<(Profile, RepoDb)> {
+    let profile = Profile::open(profile_ref)?;
     let base = Profile::expand(&profile.bigbang_path);
     let store = RepoDb::new(base, &profile.account_code, &profile.database_name);
     Ok((profile, store))
 }
 
-fn recipe_list(profile_path: &PathBuf) -> Result<()> {
-    let (profile, store) = open_store(profile_path)?;
+fn recipe_list(profile_ref: &str) -> Result<()> {
+    let (profile, store) = open_store(profile_ref)?;
     println!("✓ Profile '{}' loaded", profile.name);
     let names = store.list_names(TYPE_RECIPE)?;
     if names.is_empty() {
@@ -292,8 +303,8 @@ fn recipe_list(profile_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn recipe_show(id: &str, profile_path: &PathBuf) -> Result<()> {
-    let (_, store) = open_store(profile_path)?;
+fn recipe_show(id: &str, profile_ref: &str) -> Result<()> {
+    let (_, store) = open_store(profile_ref)?;
     match store.read_latest(TYPE_RECIPE, id)? {
         Some(value) => {
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -303,8 +314,8 @@ fn recipe_show(id: &str, profile_path: &PathBuf) -> Result<()> {
     }
 }
 
-fn recipe_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, force: bool) -> Result<()> {
-    let (_, store) = open_store(profile_path)?;
+fn recipe_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: bool) -> Result<()> {
+    let (_, store) = open_store(profile_ref)?;
     println!("📂 Target: {}", store.type_dir(TYPE_RECIPE).display());
     let outcome = recipe::install(&store, source, recursive, force)?;
 
@@ -340,21 +351,21 @@ fn recipe_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, for
     Ok(())
 }
 
-fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, profile_path: &PathBuf) -> Result<()> {
-    let vault = open_vault(profile_path)?;
+fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, profile_ref: &str) -> Result<()> {
+    let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
     vault.add(item_id, type_, description, data, &password)?;
     println!("✓ Added vault item: {item_id}");
     Ok(())
 }
 
-fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()> {
+fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool) -> Result<()> {
     use bigbang::exec::{run_definition, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
     use bigbang::recipe::{resolve_all, Recipe};
     use bigbang::task::TaskDefinition;
 
-    let profile = Profile::load(profile_path)?;
+    let profile = Profile::open(profile_ref)?;
     let store = RepoDb::new(
         Profile::expand(&profile.bigbang_path),
         &profile.account_code,
@@ -455,13 +466,13 @@ fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()>
     Ok(())
 }
 
-fn open_library(profile_path: &PathBuf) -> Result<bigbang::library::Library> {
-    let profile = Profile::load(profile_path)?;
+fn open_library(profile_ref: &str) -> Result<bigbang::library::Library> {
+    let profile = Profile::open(profile_ref)?;
     Ok(bigbang::library::Library::new(Profile::expand(&profile.library_path)))
 }
 
-fn library_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, force: bool) -> Result<()> {
-    let library = open_library(profile_path)?;
+fn library_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: bool) -> Result<()> {
+    let library = open_library(profile_ref)?;
     let mut files = Vec::new();
     if source.is_dir() {
         collect_json(source, recursive, &mut files)?;
@@ -506,8 +517,8 @@ fn collect_json(dir: &PathBuf, recursive: bool, out: &mut Vec<PathBuf>) -> Resul
     Ok(())
 }
 
-fn library_list(profile_path: &PathBuf) -> Result<()> {
-    let items = open_library(profile_path)?.list()?;
+fn library_list(profile_ref: &str) -> Result<()> {
+    let items = open_library(profile_ref)?.list()?;
     if items.is_empty() {
         println!("Library is empty");
         return Ok(());
@@ -545,7 +556,9 @@ fn shell_loop() -> Result<()> {
                 match line.as_str() {
                     "exit" | "quit" | "q" => break,
                     "help" | "?" => {
-                        println!("  profile load <path>   load a profile for this session");
+                        println!("  profile load <name>   load a profile (from ~/.bigbang/profiles)");
+                        println!("  profile load --path F load one from an explicit file");
+                        println!("  profile list          names available to load");
                         println!("  profile show          show the loaded profile");
                         println!("  forget                clear cached vault passwords");
                         println!("  <any bigbang command> e.g. recipe list");
@@ -562,13 +575,36 @@ fn shell_loop() -> Result<()> {
 
                 let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
                 if words[0] == "profile" && words.get(1).map(String::as_str) == Some("load") {
-                    match words.get(2) {
-                        Some(path) => {
-                            if let Err(err) = session.load_profile(path) {
+                    // `profile load colistor` or `profile load --path /somewhere/p.json`
+                    let target = if words.get(2).map(String::as_str) == Some("--path") {
+                        words.get(3).cloned()
+                    } else {
+                        words.get(2).cloned()
+                    };
+                    match target {
+                        Some(name) => {
+                            if let Err(err) = session.load_profile(&name) {
                                 eprintln!("❌ {err:#}");
                             }
                         }
-                        None => eprintln!("❌ usage: profile load <path>"),
+                        None => {
+                            eprintln!("❌ usage: profile load <name> | profile load --path <file>");
+                            let names = Profile::available();
+                            if !names.is_empty() {
+                                eprintln!("   available: {}", names.join(", "));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if words[0] == "profile" && words.get(1).map(String::as_str) == Some("list") {
+                    let names = Profile::available();
+                    if names.is_empty() {
+                        println!("No profiles in {}", bigbang::profile::profiles_dir().display());
+                    } else {
+                        for n in names {
+                            println!("  {n}");
+                        }
                     }
                     continue;
                 }

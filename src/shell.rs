@@ -48,11 +48,13 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn load_profile(&mut self, path: &str) -> Result<()> {
-        let profile = Profile::load(path)?;
+    /// Takes a profile name or a path — the same resolution the command line uses, so the two
+    /// never disagree about what `colistor` means.
+    pub fn load_profile(&mut self, name_or_path: &str) -> Result<()> {
+        let profile = Profile::open(name_or_path)?;
         println!("✓ Profile '{}' loaded", profile.name);
         self.profile = Some(profile);
-        self.profile_path = Some(path.to_string());
+        self.profile_path = Some(name_or_path.to_string());
         Ok(())
     }
 
