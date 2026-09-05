@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use bigbang::profile::Profile;
 use bigbang::recipe;
 use bigbang::repodb::{RepoDb, TYPE_RECIPE};
+use bigbang::vault::Vault;
 use bigbang::EXIT_FAILURE;
 
 #[derive(Parser)]
@@ -29,6 +30,40 @@ enum Command {
     Recipe {
         #[command(subcommand)]
         operation: RecipeOp,
+    },
+    /// Read encrypted credentials
+    Vault {
+        #[command(subcommand)]
+        operation: VaultOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultOp {
+    /// List item names and types, without decrypting
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// Decrypt and print one item
+    Get {
+        #[arg(long = "item-id")]
+        item_id: String,
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// Add an item to the vault
+    Add {
+        #[arg(long = "item-id")]
+        item_id: String,
+        #[arg(long)]
+        data: String,
+        #[arg(long = "type", default_value = "PASSWORD")]
+        type_: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        profile: PathBuf,
     },
 }
 
@@ -81,6 +116,71 @@ fn run() -> Result<()> {
                 recipe_install(&source, &profile, recursive, force)
             }
         },
+        Command::Vault { operation } => match operation {
+            VaultOp::List { profile } => vault_list(&profile),
+            VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
+            VaultOp::Add { item_id, data, type_, description, profile } => {
+                vault_add(&item_id, &data, &type_, description.as_deref(), &profile)
+            }
+        },
+    }
+}
+
+fn open_vault(profile_path: &PathBuf) -> Result<Vault> {
+    let profile = Profile::load(profile_path)?;
+    Ok(Vault::new(
+        Profile::expand(&profile.vault_path),
+        &profile.account_code,
+        &profile.default_vault_name,
+    ))
+}
+
+/// Same variables the Kotlin CLI honours, in the same order, so a pipeline that sets one keeps
+/// working across the migration. Refuses rather than prompting with no terminal.
+fn vault_password() -> Result<String> {
+    for var in ["COLISTOR_MASTER_PASSWORD", "BIGBANG_VAULT_PASSWORD", "VAULT_PASSWORD"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    if !bigbang::recipe::interactive() {
+        eprintln!("❌ Needs input, and this session cannot ask: Vault password");
+        eprintln!("   Set BIGBANG_VAULT_PASSWORD (or COLISTOR_MASTER_PASSWORD).");
+        std::process::exit(bigbang::EXIT_NEEDS_INPUT as i32);
+    }
+    print!("Vault password: ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn vault_list(profile_path: &PathBuf) -> Result<()> {
+    let vault = open_vault(profile_path)?;
+    let items = vault.list()?;
+    if items.is_empty() {
+        println!("No vault items found");
+        return Ok(());
+    }
+    println!("Vault items: {}", items.len());
+    for (name, type_) in items {
+        println!("  ✓ {name} ({type_})");
+    }
+    Ok(())
+}
+
+fn vault_get(item_id: &str, profile_path: &PathBuf) -> Result<()> {
+    let vault = open_vault(profile_path)?;
+    let password = vault_password()?;
+    match vault.get(item_id, &password)? {
+        Some(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        None => anyhow::bail!("Vault item not found: {item_id}"),
     }
 }
 
@@ -158,5 +258,13 @@ fn recipe_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, for
         }
         anyhow::bail!("{} recipe(s) failed to install", outcome.errors.len());
     }
+    Ok(())
+}
+
+fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, profile_path: &PathBuf) -> Result<()> {
+    let vault = open_vault(profile_path)?;
+    let password = vault_password()?;
+    vault.add(item_id, type_, description, data, &password)?;
+    println!("✓ Added vault item: {item_id}");
     Ok(())
 }

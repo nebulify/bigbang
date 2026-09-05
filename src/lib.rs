@@ -34,6 +34,7 @@
 pub mod profile;
 pub mod recipe;
 pub mod repodb;
+pub mod vault;
 
 /// The operation was attempted and failed.
 pub const EXIT_FAILURE: u8 = 1;
