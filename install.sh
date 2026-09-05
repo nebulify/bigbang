@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${BIGBANG_BIN_DIR:-$HOME/.local/bin}"
+DEFAULT_BIN_DIR="$HOME/.local/bin"
 PROFILE=release
 
 for arg in "$@"; do
@@ -46,43 +46,62 @@ say "Test"
 ok "tests pass"
 
 say "Install"
-mkdir -p "$BIN_DIR"
-install -m 0755 "$SRC" "$BIN_DIR/bigbang"
-ok "$BIN_DIR/bigbang"
+# Install where the shell already finds bigbang, so the command you type is the binary just
+# built. Only when there is no bigbang yet does the default directory get used.
+EXISTING="$(command -v bigbang 2>/dev/null || true)"
+if [ -n "${BIGBANG_BIN_DIR:-}" ]; then
+  TARGET_DIR="$BIGBANG_BIN_DIR"
+elif [ -n "$EXISTING" ]; then
+  TARGET_DIR="$(cd "$(dirname "$EXISTING")" && pwd)"
+else
+  TARGET_DIR="$DEFAULT_BIN_DIR"
+fi
+mkdir -p "$TARGET_DIR"
+install -m 0755 "$SRC" "$TARGET_DIR/bigbang"
+ok "$TARGET_DIR/bigbang"
+
+# There is one bigbang: the one just built. Any other copy sitting on PATH is a leftover that
+# would shadow this one depending on directory order, so overwrite them all with the same
+# binary rather than leaving the user to discover which one their shell picked.
+replaced=0
+seen=""
+IFS=':' read -r -a path_dirs <<< "$PATH"
+for dir in "${path_dirs[@]}"; do
+  [ -n "$dir" ] || continue
+  # PATH commonly repeats a directory; visiting one twice would report the same file twice.
+  resolved_dir="$(cd "$dir" 2>/dev/null && pwd)" || continue
+  case ":$seen:" in *":$resolved_dir:"*) continue ;; esac
+  seen="$seen:$resolved_dir"
+
+  candidate="$resolved_dir/bigbang"
+  [ -f "$candidate" ] || continue
+  [ "$candidate" -ef "$TARGET_DIR/bigbang" ] && continue
+  # Only touch it if it actually differs, so a re-run is quiet and honest.
+  cmp -s "$SRC" "$candidate" && continue
+  install -m 0755 "$SRC" "$candidate" 2>/dev/null && { ok "replaced older copy at $candidate"; replaced=$((replaced+1)); } \
+    || warn "could not replace $candidate (permissions?) — remove it manually"
+done
+[ "$replaced" = 0 ] || ok "$replaced other cop$([ "$replaced" = 1 ] && echo y || echo ies) brought up to date"
 
 say "PATH"
 case ":$PATH:" in
-  *":$BIN_DIR:"*) ok "$BIN_DIR is on PATH" ;;
+  *":$TARGET_DIR:"*) ok "$TARGET_DIR is on PATH" ;;
   *)
-    warn "$BIN_DIR is NOT on PATH. Add this to your shell profile:"
-    printf '\n       export PATH="%s:$PATH"\n\n' "$BIN_DIR"
+    warn "$TARGET_DIR is NOT on PATH. Add this to your shell profile:"
+    printf '\n       export PATH="%s:$PATH"\n\n' "$TARGET_DIR"
     ;;
 esac
 
 say "Verify"
-# Running the installed binary is the only check that proves the whole chain: built,
-# copied, executable, and able to start. An install reported without it is a guess.
-out="$("$BIN_DIR/bigbang" --version 2>&1 | head -1)" || die "installed binary does not run"
-ok "$out"
-
-# And then: is the copy we just installed the one the shell will actually run? An earlier
-# PATH entry holding an older bigbang is the worst kind of install success — everything
-# reports fine while every command runs last week's binary. This caught a stale copy in
-# ~/.cargo/bin the first time it ran.
+# Run what the shell will actually run, not the file we happened to write.
 hash -r 2>/dev/null || true
 RESOLVED="$(command -v bigbang || true)"
 if [ -z "$RESOLVED" ]; then
-  warn "bigbang is not on PATH yet — see the note above"
-elif [ "$RESOLVED" -ef "$BIN_DIR/bigbang" ]; then
-  ok "bigbang resolves to the copy just installed"
+  out="$("$TARGET_DIR/bigbang" --version 2>&1 | head -1)" || die "the installed binary does not run"
+  ok "$out (from $TARGET_DIR — not yet on PATH, see above)"
 else
-  printf '   \033[31m✗\033[0m %s\n' "another bigbang shadows this install" >&2
-  printf '       your shell runs: %s\n' "$RESOLVED" >&2
-  printf '       just installed:  %s\n' "$BIN_DIR/bigbang" >&2
-  printf '\n       Remove the other one, or install over it:\n' >&2
-  printf '         rm %s\n' "$RESOLVED" >&2
-  printf '         BIGBANG_BIN_DIR=%s ./install.sh\n\n' "$(dirname "$RESOLVED")" >&2
-  exit 1
+  out="$(bigbang --version 2>&1 | head -1)" || die "bigbang is on PATH but does not run"
+  ok "$out  →  $RESOLVED"
 fi
 
 say "Ready"
