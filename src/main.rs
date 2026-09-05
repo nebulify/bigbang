@@ -36,6 +36,52 @@ enum Command {
         #[command(subcommand)]
         operation: VaultOp,
     },
+    /// Manage the task and package library
+    Library {
+        #[command(subcommand)]
+        operation: LibraryOp,
+    },
+    /// Inspect profiles
+    Profile {
+        #[command(subcommand)]
+        operation: ProfileOp,
+    },
+    /// Start the interactive shell
+    Shell,
+}
+
+#[derive(Subcommand)]
+enum LibraryOp {
+    /// Install task or package definitions
+    Install {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long, short = 'r')]
+        recursive: bool,
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// List everything in the library
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileOp {
+    /// Check a profile file is valid
+    Validate {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// Print a profile
+    Show {
+        #[arg(long)]
+        profile: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -117,7 +163,10 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    dispatch(Cli::parse())
+}
+
+fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Recipe { operation } => match operation {
             RecipeOp::List { profile } => recipe_list(&profile),
@@ -125,6 +174,25 @@ fn run() -> Result<()> {
             RecipeOp::Execute { id, profile, dry_run } => recipe_execute(&id, &profile, dry_run),
             RecipeOp::Install { source, profile, recursive, force } => {
                 recipe_install(&source, &profile, recursive, force)
+            }
+        },
+        Command::Shell => shell_loop(),
+        Command::Library { operation } => match operation {
+            LibraryOp::Install { source, profile, recursive, force } => {
+                library_install(&source, &profile, recursive, force)
+            }
+            LibraryOp::List { profile } => library_list(&profile),
+        },
+        Command::Profile { operation } => match operation {
+            ProfileOp::Validate { profile } => {
+                let p = Profile::load(&profile)?;
+                println!("✓ Profile '{}' is valid", p.name);
+                Ok(())
+            }
+            ProfileOp::Show { profile } => {
+                let p = Profile::load(&profile)?;
+                println!("{}", serde_json::to_string_pretty(&p)?);
+                Ok(())
             }
         },
         Command::Vault { operation } => match operation {
@@ -373,5 +441,164 @@ fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()>
     }
     println!();
     println!("✓ Recipe '{}' completed", recipe.name);
+    Ok(())
+}
+
+fn open_library(profile_path: &PathBuf) -> Result<bigbang::library::Library> {
+    let profile = Profile::load(profile_path)?;
+    Ok(bigbang::library::Library::new(Profile::expand(&profile.library_path)))
+}
+
+fn library_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, force: bool) -> Result<()> {
+    let library = open_library(profile_path)?;
+    let mut files = Vec::new();
+    if source.is_dir() {
+        collect_json(source, recursive, &mut files)?;
+    } else {
+        files.push(source.clone());
+    }
+    let (mut installed, mut failed) = (0usize, 0usize);
+    for file in files {
+        match library.install_file(&file, force) {
+            Ok(item) => {
+                println!("  ✓ {} ({})", item.coordinate(), item.item_type.folder_name());
+                installed += 1;
+            }
+            Err(err) => {
+                println!("  ✗ {}: {err:#}", file.display());
+                failed += 1;
+            }
+        }
+    }
+    println!("Installed: {installed}");
+    if failed > 0 {
+        anyhow::bail!("{failed} item(s) failed to install");
+    }
+    if installed == 0 {
+        anyhow::bail!("Nothing was installed");
+    }
+    Ok(())
+}
+
+fn collect_json(dir: &PathBuf, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if recursive {
+                collect_json(&path, true, out)?;
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(())
+}
+
+fn library_list(profile_path: &PathBuf) -> Result<()> {
+    let items = open_library(profile_path)?.list()?;
+    if items.is_empty() {
+        println!("Library is empty");
+        return Ok(());
+    }
+    println!("Library items: {}", items.len());
+    for item in items {
+        println!("  ✓ {} ({})", item.coordinate(), item.item_type.folder_name());
+    }
+    Ok(())
+}
+
+/// The interactive loop. Commands are parsed by the same clap definition as the command line, so
+/// there is one grammar rather than two that drift apart — the Kotlin shell re-parses arguments in
+/// a separate code path, which is how a flag comes to work in one mode and not the other.
+fn shell_loop() -> Result<()> {
+    use bigbang::shell::Session;
+    use rustyline::error::ReadlineError;
+
+    let mut session = Session::default();
+    let mut editor = rustyline::DefaultEditor::new()?;
+    let history = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".bigbang_history"));
+    if let Some(path) = &history {
+        let _ = editor.load_history(path);
+    }
+
+    println!("BigBang shell. 'help' for commands, 'exit' to leave.");
+    loop {
+        match editor.readline(&session.prompt()) {
+            Ok(line) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                let _ = editor.add_history_entry(line.as_str());
+                match line.as_str() {
+                    "exit" | "quit" | "q" => break,
+                    "help" | "?" => {
+                        println!("  profile load <path>   load a profile for this session");
+                        println!("  profile show          show the loaded profile");
+                        println!("  forget                clear cached vault passwords");
+                        println!("  <any bigbang command> e.g. recipe list");
+                        println!("  exit                  leave");
+                        continue;
+                    }
+                    "forget" => {
+                        session.clear_passwords();
+                        println!("✓ Cached passwords cleared");
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+                if words[0] == "profile" && words.get(1).map(String::as_str) == Some("load") {
+                    match words.get(2) {
+                        Some(path) => {
+                            if let Err(err) = session.load_profile(path) {
+                                eprintln!("❌ {err:#}");
+                            }
+                        }
+                        None => eprintln!("❌ usage: profile load <path>"),
+                    }
+                    continue;
+                }
+                if words[0] == "profile" && words.get(1).map(String::as_str) == Some("show") {
+                    match &session.profile {
+                        Some(p) => println!("{}", serde_json::to_string_pretty(p)?),
+                        None => println!("No profile loaded"),
+                    }
+                    continue;
+                }
+
+                // A loaded profile fills in --profile so it need not be typed every time.
+                let mut argv: Vec<String> = vec!["bigbang".to_string()];
+                argv.extend(words.clone());
+                if !words.iter().any(|w| w == "--profile") {
+                    if let Some(path) = &session.profile_path {
+                        argv.push("--profile".into());
+                        argv.push(path.clone());
+                    }
+                }
+
+                match Cli::try_parse_from(&argv) {
+                    Ok(cli) => {
+                        if let Err(err) = dispatch(cli) {
+                            eprintln!("❌ {err:#}");
+                        }
+                    }
+                    Err(err) => println!("{err}"),
+                }
+            }
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                eprintln!("❌ {err}");
+                break;
+            }
+        }
+    }
+    if let Some(path) = &history {
+        let _ = editor.save_history(path);
+    }
+    println!("bye");
     Ok(())
 }

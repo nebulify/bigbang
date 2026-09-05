@@ -31,6 +31,10 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# Line editing and history for shell mode.
+rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
+# The cached vault password is wiped on drop rather than left in freed memory.
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [profile.release]
 lto = true

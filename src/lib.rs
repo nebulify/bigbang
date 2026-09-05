@@ -33,9 +33,11 @@
 
 pub mod exec;
 pub mod infra;
+pub mod library;
 pub mod profile;
 pub mod recipe;
 pub mod repodb;
+pub mod shell;
 pub mod task;
 pub mod vault;
 
