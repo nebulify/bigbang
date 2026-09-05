@@ -377,6 +377,7 @@ fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()>
     let library_root = PathBuf::from(Profile::expand(&profile.library_path));
 
     let mut failures = 0usize;
+    let mut targeted = 0usize;
     for role in &recipe.roles {
         let targets = resolve_role_targets(
             &instances,
@@ -386,6 +387,7 @@ fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()>
         );
         println!();
         println!("── role '{}' → {} instance(s)", role.name, targets.len());
+        targeted += targets.len();
         if targets.is_empty() {
             println!("   (no instance matches; nothing to do)");
             continue;
@@ -438,6 +440,15 @@ fn recipe_execute(id: &str, profile_path: &PathBuf, dry_run: bool) -> Result<()>
 
     if failures > 0 {
         anyhow::bail!("Recipe execution failed: {failures} task(s)");
+    }
+    // A recipe that reached no machine did nothing, and saying "completed" for that is how a
+    // deployment appears to succeed while changing nothing at all.
+    if targeted == 0 {
+        anyhow::bail!(
+            "Recipe '{}' matched no infrastructure — check the roles' selectors and infrastructureIds \
+             against the instances in this store",
+            recipe.name
+        );
     }
     println!();
     println!("✓ Recipe '{}' completed", recipe.name);

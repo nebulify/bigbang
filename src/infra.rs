@@ -68,8 +68,11 @@ impl Instance {
 /// naming neither resolves to nothing rather than to everything — the safe direction, since the
 /// alternative would run a role's commands on every machine in the project.
 ///
-/// Note the quirk, preserved deliberately: `infrastructureIds` is matched against each instance's
-/// **name**, not its id.
+/// `infrastructureIds` matches an instance's **id or its name**. The Kotlin resolver matched only
+/// the name, which silently broke every recipe that did what the field's name says and listed ids:
+/// in the production store `jump-host-uname` and `test-recipe-1` ask for `jump-host-1` (the id,
+/// whose name is `jump-host`) and resolved to nothing at all. Matching both keeps the recipes that
+/// happen to use names working, since for three of six instances id and name are identical.
 pub fn resolve_role_targets(
     all: &[Instance],
     project_id: &str,
@@ -80,7 +83,11 @@ pub fn resolve_role_targets(
 
     if let Some(ids) = infrastructure_ids {
         if !ids.is_empty() {
-            return in_project.into_iter().filter(|i| ids.contains(&i.name)).cloned().collect();
+            return in_project
+                .into_iter()
+                .filter(|i| ids.contains(&i.id) || ids.contains(&i.name))
+                .cloned()
+                .collect();
         }
     }
     if let Some(wanted) = selectors {
@@ -271,6 +278,16 @@ mod tests {
         let picked = resolve_role_targets(&all, "proj-1", None, Some(&vec!["vps".into()]));
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].name, "a");
+    }
+
+    #[test]
+    fn an_explicit_list_matches_an_id_even_when_the_name_differs() {
+        // The production store's jump host is id=jump-host-1, name=jump-host, and the recipe asks
+        // for jump-host-1. Matching names only resolved it to nothing.
+        let mut host = instance("jump-host", &["bastion"], None);
+        host.id = "jump-host-1".into();
+        let picked = resolve_role_targets(&[host], "proj-1", Some(&vec!["jump-host-1".into()]), None);
+        assert_eq!(picked.len(), 1, "an id in infrastructureIds must match");
     }
 
     #[test]
