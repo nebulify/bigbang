@@ -32,4 +32,11 @@
 //! character outside `[A-Za-z0-9._-]` with `-`.
 
 pub mod profile;
+pub mod recipe;
 pub mod repodb;
+
+/// The operation was attempted and failed.
+pub const EXIT_FAILURE: u8 = 1;
+/// Input was required and this session could not ask for it. Distinct from a failure so a pipeline
+/// can tell "nobody could answer" from "the thing went wrong".
+pub const EXIT_NEEDS_INPUT: u8 = 2;

@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use bigbang::profile::Profile;
+use bigbang::recipe;
 use bigbang::repodb::{RepoDb, TYPE_RECIPE};
-
-const EXIT_FAILURE: u8 = 1;
+use bigbang::EXIT_FAILURE;
 
 #[derive(Parser)]
 #[command(name = "bigbang", version, about = "Colistor deployment CLI")]
@@ -46,6 +46,19 @@ enum RecipeOp {
         #[arg(long)]
         profile: PathBuf,
     },
+    /// Install recipe files into the store
+    Install {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        /// Recurse into sub-directories
+        #[arg(long, short = 'r')]
+        recursive: bool,
+        /// Overwrite existing recipes without asking. What CI should pass.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -64,6 +77,9 @@ fn run() -> Result<()> {
         Command::Recipe { operation } => match operation {
             RecipeOp::List { profile } => recipe_list(&profile),
             RecipeOp::Show { id, profile } => recipe_show(&id, &profile),
+            RecipeOp::Install { source, profile, recursive, force } => {
+                recipe_install(&source, &profile, recursive, force)
+            }
         },
     }
 }
@@ -106,4 +122,41 @@ fn recipe_show(id: &str, profile_path: &PathBuf) -> Result<()> {
         }
         None => anyhow::bail!("Recipe not found: {id}"),
     }
+}
+
+fn recipe_install(source: &PathBuf, profile_path: &PathBuf, recursive: bool, force: bool) -> Result<()> {
+    let (_, store) = open_store(profile_path)?;
+    println!("📂 Target: {}", store.type_dir(TYPE_RECIPE).display());
+    let outcome = recipe::install(&store, source, recursive, force)?;
+
+    println!("{}", "=".repeat(80));
+    println!("📊 Installation Summary:");
+    println!("{}", "-".repeat(80));
+    println!("  ✓ Installed: {}", outcome.installed.len());
+    if !outcome.skipped.is_empty() {
+        println!("  ⊘ Skipped:   {}", outcome.skipped.len());
+    }
+    if !outcome.errors.is_empty() {
+        println!("  ✗ Errors:    {}", outcome.errors.len());
+    }
+    if outcome.missing_type > 0 {
+        println!("  ⓘ Ignored:   {} JSON file(s) without 'type' attribute", outcome.missing_type);
+    }
+    for id in &outcome.installed {
+        println!("  ✓ {id}");
+    }
+    for item in &outcome.skipped {
+        println!("  ⊘ {item}");
+    }
+    for (file, err) in &outcome.errors {
+        println!("  ✗ {file}: {err}");
+    }
+
+    if outcome.failed() {
+        if outcome.errors.is_empty() {
+            anyhow::bail!("Nothing was installed");
+        }
+        anyhow::bail!("{} recipe(s) failed to install", outcome.errors.len());
+    }
+    Ok(())
 }

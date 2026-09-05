@@ -1,0 +1,297 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nebulify.com/schemas/recipe.json",
+  "title": "Recipe",
+  "description": "Schema for project-specific recipes that orchestrate tasks and packages across infrastructure roles. Recipes bind infrastructure instances from RepoDB to reusable tasks/packages from the Library.",
+  "type": "object",
+  "required": ["type", "id", "name", "projectId", "roles"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "blaster:recipe",
+      "description": "Discriminator to identify this object as a Blaster recipe."
+    },
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for this recipe (human-readable)",
+      "minLength": 1,
+      "examples": ["k8s-cluster-prod", "database-ha-setup", "monitoring-stack"]
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable name of the recipe",
+      "minLength": 1,
+      "maxLength": 100,
+      "examples": [
+        "Production Kubernetes Cluster",
+        "PostgreSQL HA Setup",
+        "Monitoring Stack"
+      ]
+    },
+    "projectId": {
+      "type": "string",
+      "description": "ID of the project this recipe belongs to (FK to project-instance.id)",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description of what this recipe configures",
+      "maxLength": 1000
+    },
+    "variables": {
+      "type": "object",
+      "description": "Global variables available to all roles and their tasks/packages. Values can be literal strings or references to vault (vault:<path>) or files (file:<path>)",
+      "additionalProperties": true,
+      "examples": [
+        {
+          "kubernetes_version": "1.28",
+          "cluster_name": "production",
+          "domain": "example.com",
+          "api_key": "vault:colistor/api-keys/production",
+          "config_file": "file:./config/app.conf"
+        }
+      ]
+    },
+    "environment": {
+      "type": "object",
+      "description": "Global environment variables for all roles",
+      "additionalProperties": { "type": "string" }
+    },
+    "singleSession": {
+      "type": "boolean",
+      "description": "When true, all tasks/packages run over single SSH sessions per infrastructure",
+      "default": false
+    },
+    "roles": {
+      "type": "array",
+      "description": "Infrastructure roles with their task/package sequences",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/role"
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp when the recipe was created"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp when the recipe was last updated"
+    }
+  },
+  "definitions": {
+    "role": {
+      "type": "object",
+      "description": "A role definition mapping infrastructure instances to tasks/packages",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the role (e.g., 'master', 'worker', 'load-balancer')",
+          "minLength": 1,
+          "maxLength": 50,
+          "examples": ["master", "worker", "slave", "gateway", "load-balancer"]
+        },
+        "description": {
+          "type": "string",
+          "description": "Description of what nodes with this role do",
+          "maxLength": 500
+        },
+        "infrastructureIds": {
+          "type": "array",
+          "description": "Specific infrastructure instance IDs for this role (FKs to infrastructure.id)",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "examples": [
+            ["k8s-master-1"],
+            ["k8s-worker-1", "k8s-worker-2"],
+            ["load-balancer-1"]
+          ]
+        },
+        "selectors": {
+          "type": "array",
+          "description": "Alternative: select infrastructure by selectors instead of specific IDs",
+          "items": { "type": "string" },
+          "examples": [
+            ["kubernetes-master"],
+            ["kubernetes-worker", "production"]
+          ]
+        },
+        "variables": {
+          "type": "object",
+          "description": "Role-specific variables that override global variables. Supports literal values, vault references (vault:<path>), and file references (file:<path>)",
+          "additionalProperties": true
+        },
+        "environment": {
+          "type": "object",
+          "description": "Role-specific environment variables",
+          "additionalProperties": { "type": "string" }
+        },
+        "items": {
+          "type": "array",
+          "description": "Sequence of tasks and packages to execute for this role",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/recipeItem"
+          }
+        }
+      }
+    },
+    "recipeItem": {
+      "oneOf": [
+        { "$ref": "#/definitions/recipeTask" },
+        { "$ref": "#/definitions/recipePackage" }
+      ]
+    },
+    "recipeTask": {
+      "type": "object",
+      "description": "Reference to a task from the Library to execute",
+      "required": ["task"],
+      "properties": {
+        "task": {
+          "type": "string",
+          "description": "Library path to task: group/name/version or just name for default group",
+          "minLength": 1,
+          "examples": [
+            "com.nebulify.bigbang/update-debian-system/1.0",
+            "update-debian-system"
+          ]
+        },
+        "variables": {
+          "type": "object",
+          "description": "Task-specific variables. Supports literal values, vault references (vault:<path>), and file references (file:<path>)",
+          "additionalProperties": true
+        },
+        "skipIf": {
+          "type": "string",
+          "description": "Skip if condition is true (shell command)"
+        },
+        "runIf": {
+          "type": "string",
+          "description": "Only run if condition is true (shell command)"
+        },
+        "continueOnError": {
+          "type": "boolean",
+          "description": "Continue if this task fails",
+          "default": false
+        },
+        "description": {
+          "type": "string",
+          "description": "Why this task is executed"
+        },
+        "order": {
+          "type": "integer",
+          "description": "Execution order (lower = earlier)",
+          "minimum": 0
+        }
+      }
+    },
+    "recipePackage": {
+      "type": "object",
+      "description": "Reference to a package from the Library to execute",
+      "required": ["package"],
+      "properties": {
+        "package": {
+          "type": "string",
+          "description": "Library path to package: group/name/version or just name",
+          "minLength": 1,
+          "examples": [
+            "com.nebulify.bigbang/kubernetes-cluster-setup/1.0.0",
+            "longhorn-setup"
+          ]
+        },
+        "variables": {
+          "type": "object",
+          "description": "Package-specific variables. Supports literal values, vault references (vault:<path>), and file references (file:<path>)",
+          "additionalProperties": true
+        },
+        "skipIf": {
+          "type": "string",
+          "description": "Skip if condition is true"
+        },
+        "runIf": {
+          "type": "string",
+          "description": "Only run if condition is true"
+        },
+        "continueOnError": {
+          "type": "boolean",
+          "description": "Continue if this package fails",
+          "default": false
+        },
+        "description": {
+          "type": "string",
+          "description": "Why this package is executed"
+        },
+        "order": {
+          "type": "integer",
+          "description": "Execution order",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "type": "blaster:recipe",
+      "id": "k8s-cluster-prod",
+      "name": "Production Kubernetes Cluster",
+      "projectId": "proj-1",
+      "description": "Complete k8s cluster setup with master, worker, and load balancer",
+      "variables": {
+        "kubernetes_version": "1.28",
+        "cluster_name": "colistor-prod"
+      },
+      "roles": [
+        {
+          "name": "jump-host",
+          "infrastructureIds": ["jump-host-1"],
+          "items": [{ "task": "com.nebulify.bigbang/setup-jump-host/1.0" }]
+        },
+        {
+          "name": "master",
+          "infrastructureIds": ["k8s-master-1"],
+          "items": [
+            { "task": "com.nebulify.bigbang/update-debian-system/1.0" },
+            {
+              "package": "com.nebulify.bigbang/kubernetes-cluster-setup/1.0.0"
+            },
+            { "package": "com.nebulify.bigbang/longhorn-setup/1.0" }
+          ]
+        },
+        {
+          "name": "worker",
+          "infrastructureIds": ["k8s-worker-1"],
+          "items": [
+            { "task": "com.nebulify.bigbang/update-debian-system/1.0" },
+            { "package": "com.nebulify.bigbang/longhorn-worker-setup/1.0" }
+          ]
+        },
+        {
+          "name": "load-balancer",
+          "infrastructureIds": ["load-balancer-1"],
+          "items": [
+            { "package": "com.nebulify.bigbang/nginx-load-balancer-stack/1.0" }
+          ]
+        }
+      ]
+    }
+  ],
+  "constraints": {
+    "primaryKey": "id",
+    "foreignKeys": [
+      {
+        "field": "projectId",
+        "references": {
+          "objectType": "project-instance",
+          "key": "id"
+        },
+        "required": true
+      }
+    ],
+    "uniqueKeys": ["name"]
+  }
+}
