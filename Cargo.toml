@@ -1,0 +1,27 @@
+[package]
+name = "bigbang"
+version = "0.1.0"
+edition = "2021"
+description = "Colistor deployment CLI — recipes, vault, library and profiles over RepoDB"
+license = "Proprietary"
+
+[[bin]]
+name = "bigbang"
+path = "src/main.rs"
+
+[lib]
+name = "bigbang"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# jsonschema lands in the slice that ports `recipe install`; its default features pull in
+# reqwest and tower-http for remote $ref resolution, which this tool never wants.
+
+[profile.release]
+lto = true
+strip = true
