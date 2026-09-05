@@ -31,9 +31,11 @@
 //! where `<ver>` is `yyyyMMdd-HHmmss-SSS-xx-<name>` and names are sanitised by replacing every
 //! character outside `[A-Za-z0-9._-]` with `-`.
 
+pub mod exec;
 pub mod profile;
 pub mod recipe;
 pub mod repodb;
+pub mod task;
 pub mod vault;
 
 /// The operation was attempted and failed.
