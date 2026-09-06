@@ -146,6 +146,9 @@ enum RecipeOp {
         /// Resolve and print the plan without running anything
         #[arg(long)]
         dry_run: bool,
+        /// Supply a variable directly: --var name=value. Beats the recipe and the environment.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
     },
     /// Install recipe files into the store
     Install {
@@ -182,7 +185,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Recipe { operation } => match operation {
             RecipeOp::List { profile } => recipe_list(&profile),
             RecipeOp::Show { id, profile } => recipe_show(&id, &profile),
-            RecipeOp::Execute { id, profile, dry_run } => recipe_execute(&id, &profile, dry_run),
+            RecipeOp::Execute { id, profile, dry_run, vars } => {
+                recipe_execute(&id, &profile, dry_run, &vars)
+            }
             RecipeOp::Install { source, profile, recursive, force } => {
                 recipe_install(&source, &profile, recursive, force)
             }
@@ -359,7 +364,7 @@ fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, 
     Ok(())
 }
 
-fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool) -> Result<()> {
+fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -> Result<()> {
     use bigbang::exec::{run_definition, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
     use bigbang::recipe::{resolve_all, Recipe};
@@ -381,9 +386,17 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool) -> Result<()> {
     println!("║  Recipe Execution: {}", recipe.name);
     println!("╚════════════════════════════════════════════════════════════╝");
 
+    let mut overrides = std::collections::BTreeMap::new();
+    for pair in vars {
+        let (name, value) = pair
+            .split_once('=')
+            .with_context(|| format!("--var expects NAME=VALUE, got '{pair}'"))?;
+        overrides.insert(name.to_string(), value.to_string());
+    }
+
     let vault_root = Profile::expand(&profile.vault_path);
     let password = || vault_password();
-    let recipe_vars = resolve_all(&recipe.variables, &vault_root, &password)?;
+    let recipe_vars = resolve_all(&recipe.variables, &vault_root, &password, &overrides)?;
     let instances = load_instances(&store)?;
     let library_root = PathBuf::from(Profile::expand(&profile.library_path));
 
@@ -404,7 +417,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool) -> Result<()> {
             continue;
         }
 
-        let role_vars = resolve_all(&role.variables, &vault_root, &password)?;
+        let role_vars = resolve_all(&role.variables, &vault_root, &password, &overrides)?;
         let mut merged = recipe_vars.clone();
         merged.extend(role_vars);
 
@@ -431,7 +444,10 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool) -> Result<()> {
                     .with_context(|| format!("no sshKeyId on instance {}", instance.name))?;
                 let key = resolve_ssh_key(key_id, &vault_root, &password()?)?;
                 let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
-                let mut executor = SshExecutor { target, echo: true };
+                // Everything resolved counts as a secret for masking. Over-masking a database
+                // name costs a line of readability; under-masking a password costs the password.
+                let secrets: Vec<String> = merged.values().cloned().collect();
+                let mut executor = SshExecutor { target, echo: true, secrets };
 
                 let outcomes = run_definition(&definition, &merged, &mut executor)?;
                 for outcome in &outcomes {

@@ -44,6 +44,24 @@ pub struct SshTarget {
 pub struct SshExecutor {
     pub target: SshTarget,
     pub echo: bool,
+    /// Values that must never reach a log. Resolved secrets get substituted into commands, so an
+    /// echoed command line would otherwise print the database password into CI output — where it
+    /// is retained, searchable, and readable by anyone who can see the run.
+    pub secrets: Vec<String>,
+}
+
+/// Replace every known secret with `***`.
+///
+/// Values shorter than six characters are left alone: masking those would shred unrelated output
+/// for no gain, and a secret that short is not protected by masking anyway.
+pub fn mask(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 6 {
+            out = out.replace(secret.as_str(), "***");
+        }
+    }
+    out
 }
 
 impl SshExecutor {
@@ -75,7 +93,7 @@ impl CommandExecutor for SshExecutor {
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[SSH] -> {}@{}:{}", self.target.user, self.target.host, self.target.port);
-            println!("$ {command}");
+            println!("$ {}", mask(command, &self.secrets));
         }
         // `timeout` wraps ssh rather than being enforced in-process: it kills the whole child,
         // including a remote command still producing output, which a read-side deadline would not.
@@ -86,7 +104,9 @@ impl CommandExecutor for SshExecutor {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         if self.echo && !text.is_empty() {
-            print!("{text}");
+            // Output is masked too: a command that echoes its own arguments, or an error quoting
+            // the failing statement, leaks what the command line alone would not.
+            print!("{}", mask(&text, &self.secrets));
         }
         Ok(CommandResult { exit_code: out.status.code().unwrap_or(-1), output: text })
     }
@@ -326,6 +346,17 @@ mod tests {
     }
 
     #[test]
+    fn secrets_are_masked_in_anything_echoed() {
+        let secrets = vec![String::from("s3cret-password"), String::from("ab")];
+        let line = String::from("psql -c \"ALTER USER x PASSWORD 's3cret-password'\"");
+        let masked = mask(&line, &secrets);
+        assert!(!masked.contains("s3cret-password"), "the secret survived: {masked}");
+        assert!(masked.contains("***"));
+        // Too short to be worth masking, and masking it would shred unrelated output.
+        assert_eq!(mask("about", &secrets), "about");
+    }
+
+    #[test]
     fn ssh_argv_matches_the_kotlin_flags() {
         let ssh = SshExecutor {
             target: SshTarget {
@@ -333,6 +364,7 @@ mod tests {
                 key_path: "/k/id".into(), jump: Some("debian@57.129.31.14".into()),
             },
             echo: false,
+            secrets: Vec::new(),
         };
         let argv = ssh.argv("uptime");
         assert_eq!(argv[argv.len() - 2], "debian@10.1.1.75");

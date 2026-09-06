@@ -185,8 +185,19 @@ pub struct RoleItem {
     pub continue_on_error: bool,
 }
 
-/// Resolve one variable value: `vault:account/project/id` decrypts, `file:path` reads, anything
-/// else is used as written.
+/// Resolve one variable value.
+///
+/// | form | source |
+/// |---|---|
+/// | `vault:account/project/id` | the encrypted vault — a laptop with the passphrase |
+/// | `env:NAME` | the process environment — CI, where GitHub holds the secret |
+/// | `file:/path` | a file on disk |
+/// | anything else | used as written |
+///
+/// `env:` exists so the same recipe runs in both places: a laptop resolves `vault:` references
+/// against a local vault, and CI supplies the same values from GitHub Environment secrets without
+/// the vault ever being committed. See [`resolve_all`] for the override that lets one recipe do
+/// both without being edited.
 ///
 /// A reference that cannot be resolved is an error, never an empty string — an unresolved password
 /// silently becoming `""` is a command that runs with the wrong credentials rather than failing.
@@ -217,6 +228,19 @@ pub fn resolve_value(
             .with_context(|| format!("Vault item not found: {key} in {}/{}", parts[0], parts[1]));
     }
 
+    if let Some(name) = raw.strip_prefix("env:") {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("env reference has no variable name");
+        }
+        return match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => anyhow::bail!(
+                "environment variable '{name}' is not set (or is empty) — it is referenced as 'env:{name}'"
+            ),
+        };
+    }
+
     if let Some(path) = raw.strip_prefix("file:") {
         let expanded = crate::profile::Profile::expand(path);
         return fs::read_to_string(&expanded)
@@ -226,13 +250,41 @@ pub fn resolve_value(
     Ok(raw)
 }
 
+/// The environment variable that overrides a declared variable: `db_password` becomes
+/// `BIGBANG_VAR_DB_PASSWORD`.
+pub fn override_env_name(key: &str) -> String {
+    format!("BIGBANG_VAR_{}", key.to_uppercase().replace('-', "_"))
+}
+
+/// Resolve every variable, honouring overrides.
+///
+/// Precedence, highest first:
+///
+/// 1. `overrides` — what `--var name=value` supplied
+/// 2. `BIGBANG_VAR_<NAME>` in the environment
+/// 3. the value the recipe declares, itself possibly `vault:`, `env:` or `file:`
+///
+/// The point of 1 and 2 is that a recipe written with `vault:` references — the right thing on a
+/// laptop — runs unchanged in CI, where no vault exists and GitHub holds the secret. One recipe,
+/// no branching inside it on where it thinks it is running, and the vault never leaves the laptop.
 pub fn resolve_all(
     variables: &BTreeMap<String, serde_json::Value>,
     vault_root: &str,
     password: &dyn Fn() -> anyhow::Result<String>,
+    overrides: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for (key, value) in variables {
+        if let Some(supplied) = overrides.get(key) {
+            out.insert(key.clone(), supplied.clone());
+            continue;
+        }
+        if let Ok(from_env) = std::env::var(override_env_name(key)) {
+            if !from_env.is_empty() {
+                out.insert(key.clone(), from_env);
+                continue;
+            }
+        }
         let resolved = resolve_value(value, vault_root, password)
             .with_context(|| format!("resolving variable '{key}'"))?;
         out.insert(key.clone(), resolved);
@@ -264,5 +316,57 @@ mod value_tests {
     fn a_malformed_vault_reference_is_an_error_not_an_empty_string() {
         let v = serde_json::json!("vault:too/short");
         assert!(resolve_value(&v, "/vault", &no_password).is_err());
+    }
+
+    #[test]
+    fn an_env_reference_reads_the_environment() {
+        std::env::set_var("BIGBANG_TEST_SECRET", "from-the-environment");
+        let v = serde_json::json!("env:BIGBANG_TEST_SECRET");
+        assert_eq!(resolve_value(&v, "/vault", &no_password).unwrap(), "from-the-environment");
+        std::env::remove_var("BIGBANG_TEST_SECRET");
+    }
+
+    #[test]
+    fn an_unset_env_reference_fails_rather_than_resolving_to_nothing() {
+        let v = serde_json::json!("env:BIGBANG_DEFINITELY_UNSET");
+        let err = resolve_value(&v, "/vault", &no_password).unwrap_err();
+        assert!(format!("{err:#}").contains("not set"));
+    }
+
+    #[test]
+    fn an_override_replaces_a_vault_reference_without_touching_the_vault() {
+        // This is what lets one recipe run on a laptop and in CI: the vault reference is never
+        // resolved, so no vault and no passphrase are needed.
+        let mut vars = BTreeMap::new();
+        vars.insert("db_password".to_string(), serde_json::json!("vault:a/b/c"));
+        let mut overrides = BTreeMap::new();
+        overrides.insert("db_password".to_string(), "supplied".to_string());
+        let out = resolve_all(&vars, "/nonexistent", &no_password, &overrides).unwrap();
+        assert_eq!(out["db_password"], "supplied");
+    }
+
+    #[test]
+    fn the_env_override_follows_the_variable_name() {
+        assert_eq!(override_env_name("db_password"), "BIGBANG_VAR_DB_PASSWORD");
+        assert_eq!(override_env_name("image-tag"), "BIGBANG_VAR_IMAGE_TAG");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("db_password".to_string(), serde_json::json!("vault:a/b/c"));
+        std::env::set_var("BIGBANG_VAR_DB_PASSWORD", "from-ci");
+        let out = resolve_all(&vars, "/nonexistent", &no_password, &BTreeMap::new()).unwrap();
+        assert_eq!(out["db_password"], "from-ci");
+        std::env::remove_var("BIGBANG_VAR_DB_PASSWORD");
+    }
+
+    #[test]
+    fn an_explicit_var_beats_the_environment() {
+        let mut vars = BTreeMap::new();
+        vars.insert("x".to_string(), serde_json::json!("declared"));
+        std::env::set_var("BIGBANG_VAR_X", "from-env");
+        let mut overrides = BTreeMap::new();
+        overrides.insert("x".to_string(), "from-flag".to_string());
+        let out = resolve_all(&vars, "/v", &no_password, &overrides).unwrap();
+        assert_eq!(out["x"], "from-flag");
+        std::env::remove_var("BIGBANG_VAR_X");
     }
 }
