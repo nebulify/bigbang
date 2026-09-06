@@ -293,8 +293,13 @@ pub fn validate(instance: &Instance) -> Result<()> {
     if instance.is_local() {
         return Ok(());
     }
-    if instance.public_ip.is_none() && instance.private_ip.is_none() {
-        bail!("needs 'publicIpAddress' or 'privateIpAddress'");
+    // Blank counts as absent. A destroyed machine's inventory entry is kept as a template with the
+    // address cleared, and a cloud provider reissues that address to someone else — so an empty
+    // string must refuse at import rather than resolve to "" and have ssh do something surprising
+    // with it.
+    let has_address = |a: &Option<String>| a.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_address(&instance.public_ip) && !has_address(&instance.private_ip) {
+        bail!("needs 'publicIpAddress' or 'privateIpAddress' — fill in the address of the machine that was provisioned");
     }
     match instance.ssh_username.as_deref() {
         Some(u) if !u.trim().is_empty() => {}
@@ -512,6 +517,17 @@ mod tests {
         no_address.public_ip = None;
         no_address.private_ip = None;
         assert!(validate(&no_address).is_err());
+
+        // A blank address is how a destroyed machine's entry is kept as a template. It must be
+        // refused, not resolved to an empty host — the provider will have reissued that address.
+        let mut blank = ok.clone();
+        blank.public_ip = Some("".into());
+        blank.private_ip = None;
+        assert!(validate(&blank).is_err(), "a blank address must be refused");
+        let mut whitespace = ok.clone();
+        whitespace.public_ip = Some("   ".into());
+        whitespace.private_ip = None;
+        assert!(validate(&whitespace).is_err(), "a whitespace address must be refused");
 
         // LOCAL has no host to reach, so none of the ssh fields apply to it.
         let mut local = instance("here", &[], None);
