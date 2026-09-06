@@ -459,7 +459,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                 } else {
                     let key_id = instance.ssh_key_id.as_deref()
                         .with_context(|| format!("no sshKeyId on instance {}", instance.name))?;
-                    let key = resolve_ssh_key(key_id, &vault_root, &password()?)?;
+                    let key = resolve_ssh_key(key_id, &vault_root, &password)?;
                     let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
                     _key_guard = key; // keep the temporary key file alive for the whole run
                     Box::new(SshExecutor { target, echo: true, secrets })

@@ -14,6 +14,36 @@ use crate::task::{substitute, DetailedCommand, Task, TaskDefinition};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// Turn a rendered command into the string actually sent to a shell, honouring `runAs`.
+///
+/// This was missing, and only a real host revealed it: every task declaring `"runAs": "root"` ran
+/// as the login user instead, so `apt-get update` came back with "Could not open lock file …
+/// Permission denied". 275 of the repository's task steps declare runAs, so silently ignoring it
+/// meant most of them could never have worked.
+///
+/// Matching the Kotlin executor: wrap in `bash -lc` so a login shell, `~` and PATH behave as a task
+/// author expects, then elevate with `sudo -n` — non-interactive, so a host that would prompt for a
+/// password fails immediately instead of hanging forever on a prompt nobody can answer.
+pub fn wrap_command(rendered: &str, run_as: Option<&str>, variables: &BTreeMap<String, String>) -> String {
+    // Single quotes inside the payload are escaped the shell's own way: close, emit an escaped
+    // quote, reopen.
+    let payload = rendered.replace('\'', "'\"'\"'");
+    let wrapped = format!("bash -lc '{payload}'");
+
+    match run_as {
+        None => wrapped,
+        Some(user) if user.trim().is_empty() => wrapped,
+        Some("root") => format!("sudo -n {wrapped}"),
+        // "user" is symbolic: it means whatever the recipe called `user`, and if it named nobody
+        // then the command simply runs as the connecting account.
+        Some("user") => match variables.get("user").filter(|v| !v.trim().is_empty()) {
+            Some(named) => format!("sudo -n -u {named} {wrapped}"),
+            None => wrapped,
+        },
+        Some(other) => format!("sudo -n -u {other} {wrapped}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     pub exit_code: i32,
@@ -187,7 +217,7 @@ fn run_task(
 
     // A task-level condition gates everything below it.
     if let Some(condition) = &task.condition {
-        let rendered = substitute(condition, variables);
+        let rendered = wrap_command(&substitute(condition, variables), task.run_as.as_deref(), variables);
         if !executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
             outcome.skipped.push(format!("task '{}' (condition not met)", task.name));
             return Ok(outcome);
@@ -196,9 +226,9 @@ fn run_task(
 
     for command in &task.commands {
         let detail = command.detail();
-        let rendered = substitute(&detail.cmd, variables);
+        let rendered = wrap_command(&substitute(&detail.cmd, variables), task.run_as.as_deref(), variables);
 
-        if should_skip(&detail, variables, executor)? {
+        if should_skip(&detail, variables, task.run_as.as_deref(), executor)? {
             outcome.skipped.push(rendered);
             continue;
         }
@@ -221,7 +251,7 @@ fn run_task(
 
     // Verification runs only once the task's own commands are done, and every one must pass.
     for check in &task.verification {
-        let rendered = substitute(check, variables);
+        let rendered = wrap_command(&substitute(check, variables), task.run_as.as_deref(), variables);
         if !executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
             outcome.failed = Some(format!("verification failed: {rendered}"));
             return Ok(outcome);
@@ -234,16 +264,19 @@ fn run_task(
 fn should_skip(
     detail: &DetailedCommand,
     variables: &BTreeMap<String, String>,
+    run_as: Option<&str>,
     executor: &mut dyn CommandExecutor,
 ) -> Result<bool> {
+    // The guard runs as the same user as the command it guards: a skipIf that checks a root-only
+    // path would otherwise fail for lack of permission and run the work every time.
     if let Some(skip_if) = &detail.skip_if {
-        let rendered = substitute(skip_if, variables);
+        let rendered = wrap_command(&substitute(skip_if, variables), run_as, variables);
         if executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
             return Ok(true);
         }
     }
     if let Some(run_if) = &detail.run_if {
-        let rendered = substitute(run_if, variables);
+        let rendered = wrap_command(&substitute(run_if, variables), run_as, variables);
         if !executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
             return Ok(true);
         }
@@ -317,28 +350,28 @@ mod tests {
             skip_if: Some("schema exists".into()),
             ..Default::default()
         });
-        let mut fake = Fake::new(1).answer("schema exists", 0);
+        let mut fake = Fake::new(1).answer("bash -lc 'schema exists'", 0);
         let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
         assert_eq!(outcome.ran.len(), 0);
-        assert_eq!(outcome.skipped, vec!["create schema".to_string()]);
-        assert!(!fake.seen.contains(&"create schema".to_string()), "the guarded command must not run");
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(!fake.seen.iter().any(|c| c.contains("create schema")), "the guarded command must not run");
     }
 
     #[test]
     fn a_failure_stops_the_task_unless_tolerated() {
         let boom = TaskCommand::Simple("boom".into());
         let after = TaskCommand::Simple("after".into());
-        let mut fake = Fake::new(0).answer("boom", 3);
+        let mut fake = Fake::new(0).answer("bash -lc 'boom'", 3);
         let outcome = run_task(&task(vec![boom.clone(), after.clone()]), &BTreeMap::new(), &mut fake).unwrap();
         assert!(outcome.failed.is_some());
-        assert!(!fake.seen.contains(&"after".to_string()), "must not continue past a failure");
+        assert!(!fake.seen.iter().any(|c| c.contains("after")), "must not continue past a failure");
 
         let mut tolerant = task(vec![boom, after]);
         tolerant.continue_on_error = true;
-        let mut fake2 = Fake::new(0).answer("boom", 3);
+        let mut fake2 = Fake::new(0).answer("bash -lc 'boom'", 3);
         let outcome2 = run_task(&tolerant, &BTreeMap::new(), &mut fake2).unwrap();
         assert!(outcome2.failed.is_none());
-        assert!(fake2.seen.contains(&"after".to_string()));
+        assert!(fake2.seen.iter().any(|c| c.contains("after")));
     }
 
     #[test]
@@ -363,7 +396,7 @@ mod tests {
     fn verification_failure_fails_the_task_even_when_commands_passed() {
         let mut t = task(vec![TaskCommand::Simple("do it".into())]);
         t.verification = vec!["check it".into()];
-        let mut fake = Fake::new(0).answer("check it", 1);
+        let mut fake = Fake::new(0).answer("bash -lc 'check it'", 1);
         let outcome = run_task(&t, &BTreeMap::new(), &mut fake).unwrap();
         assert!(outcome.failed.unwrap().contains("verification failed"));
     }
@@ -378,6 +411,32 @@ mod tests {
         let mut fake = Fake::new(1);
         let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
         assert!(outcome.failed.is_none());
+    }
+
+    #[test]
+    fn run_as_root_elevates_and_run_as_nothing_does_not() {
+        let vars = BTreeMap::new();
+        assert_eq!(wrap_command("apt-get update", None, &vars), "bash -lc 'apt-get update'");
+        assert_eq!(wrap_command("apt-get update", Some("root"), &vars),
+                   "sudo -n bash -lc 'apt-get update'");
+        assert_eq!(wrap_command("psql", Some("postgres"), &vars),
+                   "sudo -n -u postgres bash -lc 'psql'");
+    }
+
+    #[test]
+    fn a_single_quote_in_a_command_survives_the_wrapping() {
+        let vars = BTreeMap::new();
+        let wrapped = wrap_command("echo 'not present'", Some("root"), &vars);
+        assert_eq!(wrapped, r#"sudo -n bash -lc 'echo '"'"'not present'"'"''"#);
+    }
+
+    #[test]
+    fn symbolic_user_resolves_through_the_variables() {
+        let mut vars = BTreeMap::new();
+        // Nobody named: no elevation rather than sudo to a user that does not exist.
+        assert_eq!(wrap_command("id", Some("user"), &vars), "bash -lc 'id'");
+        vars.insert("user".to_string(), "debian".to_string());
+        assert_eq!(wrap_command("id", Some("user"), &vars), "sudo -n -u debian bash -lc 'id'");
     }
 
     #[test]

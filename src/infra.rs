@@ -151,7 +151,15 @@ const KEY_MARKERS: [&str; 5] = [
 
 /// `file:/path/to/key` uses it where it lies; `vault:account/project/id` decrypts to a private
 /// temporary file.
-pub fn resolve_ssh_key(ssh_key_id: &str, vault_root: &str, password: &str) -> Result<KeyFile> {
+///
+/// The password is a closure so it is only demanded when a vault reference actually needs it. Asking
+/// eagerly meant a host whose key is a plain file still stopped to demand a vault password — and in
+/// a non-interactive session that is not a prompt, it is a refusal to run at all.
+pub fn resolve_ssh_key(
+    ssh_key_id: &str,
+    vault_root: &str,
+    password: &dyn Fn() -> Result<String>,
+) -> Result<KeyFile> {
     if let Some(path) = ssh_key_id.strip_prefix("file:") {
         return Ok(KeyFile { path: PathBuf::from(crate::profile::Profile::expand(path)), temporary: false });
     }
@@ -175,7 +183,8 @@ pub fn resolve_ssh_key(ssh_key_id: &str, vault_root: &str, password: &str) -> Re
 
     let payload: vault::EncryptedPayload = serde_json::from_str(&item.encrypted_content)
         .context("parsing the encrypted key payload")?;
-    let key = vault::decrypt(password, &payload).context("decrypting the SSH key")?;
+    let pw = password()?;
+    let key = vault::decrypt(&pw, &payload).context("decrypting the SSH key")?;
 
     // Refuse early rather than handing ssh something that is not a key: the error it gives back is
     // far less informative than this one.
@@ -350,10 +359,18 @@ mod tests {
     }
 
     #[test]
+    fn a_file_reference_never_asks_for_the_vault_password() {
+        // The closure panics if called: a file: key must not touch the vault at all.
+        let key = resolve_ssh_key("file:/dev/null", "/nonexistent",
+            &|| panic!("the vault password must not be requested for a file: key"));
+        assert!(key.is_ok());
+    }
+
+    #[test]
     fn a_vault_reference_that_is_not_a_key_is_refused() {
         // Guards the case where the wrong vault item is referenced: ssh's own error for this is
         // "Load key: invalid format", which sends you looking in the wrong place.
-        let err = resolve_ssh_key("vault:a/b/c", "/nonexistent", "pw").unwrap_err();
+        let err = resolve_ssh_key("vault:a/b/c", "/nonexistent", &|| Ok("pw".to_string())).unwrap_err();
         assert!(format!("{err:#}").contains("not found") || format!("{err:#}").contains("No such file"));
     }
 
