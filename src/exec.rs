@@ -195,6 +195,10 @@ pub fn run_definition(
     for (k, v) in variables {
         merged.insert(k.clone(), v.clone());
     }
+    // Values may name other variables, and this is the map the commands are actually rendered
+    // against — resolving only in `merge_variables` left this path one pass short, which is how
+    // `${postgres_major_version}` reached the shell verbatim.
+    let merged = crate::task::resolve_nested(merged);
 
     let mut outcomes = Vec::new();
     for task in &definition.tasks {
@@ -341,6 +345,60 @@ mod tests {
             name: "t".into(), description: None, run_as: None,
             commands, continue_on_error: false, verification: vec![], condition: None,
         }
+    }
+
+    /// The bug this pins: `run_definition` merged the definition's variables by hand and never
+    /// flattened values that name other variables, so a command was rendered with
+    /// `${postgres_major_version}` still in it and ran against a path that cannot exist.
+    #[test]
+    fn a_definition_variable_naming_another_variable_reaches_the_command_resolved() {
+        let mut variables = BTreeMap::new();
+        variables.insert("postgres_major_version".to_string(), "17".to_string());
+        variables.insert(
+            "postgres_config_dir".to_string(),
+            "/etc/postgresql/${postgres_major_version}/main".to_string(),
+        );
+        let definition = crate::task::TaskDefinition {
+            group: None,
+            name: "configure".into(),
+            version: None,
+            description: None,
+            variables,
+            environment: BTreeMap::new(),
+            selectors: vec![],
+            tasks: vec![task(vec![TaskCommand::Simple(
+                "cp ${postgres_config_dir}/postgresql.conf /tmp/b".into(),
+            )])],
+        };
+
+        let mut fake = Fake::new(0);
+        run_definition(&definition, &BTreeMap::new(), &mut fake).unwrap();
+        assert_eq!(fake.seen.len(), 1);
+        assert!(
+            fake.seen[0].contains("/etc/postgresql/17/main/postgresql.conf"),
+            "expected a resolved path, got: {}",
+            fake.seen[0]
+        );
+        assert!(!fake.seen[0].contains("${"), "no placeholder may survive: {}", fake.seen[0]);
+    }
+
+    /// The caller's layer must still win, and carry the nested value with it.
+    #[test]
+    fn a_caller_override_of_the_inner_variable_moves_the_outer_one() {
+        let mut variables = BTreeMap::new();
+        variables.insert("major".to_string(), "17".to_string());
+        variables.insert("dir".to_string(), "/etc/postgresql/${major}/main".to_string());
+        let definition = crate::task::TaskDefinition {
+            group: None, name: "d".into(), version: None, description: None,
+            variables, environment: BTreeMap::new(), selectors: vec![],
+            tasks: vec![task(vec![TaskCommand::Simple("ls ${dir}".into())])],
+        };
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("major".to_string(), "16".to_string());
+        let mut fake = Fake::new(0);
+        run_definition(&definition, &overrides, &mut fake).unwrap();
+        assert!(fake.seen[0].contains("/etc/postgresql/16/main"), "got: {}", fake.seen[0]);
     }
 
     #[test]

@@ -46,6 +46,11 @@ enum Command {
         #[command(subcommand)]
         operation: ProfileOp,
     },
+    /// Manage the machine inventory
+    Infra {
+        #[command(subcommand)]
+        operation: InfraOp,
+    },
     /// Start the interactive shell
     Shell,
 }
@@ -85,6 +90,27 @@ enum ProfileOp {
         /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
         #[arg(long)]
         profile: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InfraOp {
+    /// List the machines in the inventory
+    List {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+    },
+    /// Import machine definitions from a file or a directory
+    Import {
+        /// A .json instance definition, or a directory of them
+        source: PathBuf,
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+        /// Replace an instance that is already in the store
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -211,6 +237,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Command::Infra { operation } => match operation {
+            InfraOp::List { profile } => infra_list(&profile),
+            InfraOp::Import { source, profile, force } => infra_import(&source, &profile, force),
+        },
         Command::Vault { operation } => match operation {
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
@@ -284,6 +314,65 @@ fn open_store(profile_ref: &str) -> Result<(Profile, RepoDb)> {
     let base = Profile::expand(&profile.bigbang_path);
     let store = RepoDb::new(base, &profile.account_code, &profile.database_name);
     Ok((profile, store))
+}
+
+fn infra_list(profile_ref: &str) -> Result<()> {
+    let (profile, store) = open_store(profile_ref)?;
+    println!("✓ Profile '{}' loaded", profile.name);
+    let instances = bigbang::infra::load_instances(&store)?;
+    if instances.is_empty() {
+        println!("No machines in the inventory");
+        return Ok(());
+    }
+    println!("Machines: {}", instances.len());
+    for i in &instances {
+        let address = i.address().unwrap_or_else(|_| "—".to_string());
+        let via = i.jump_host_id.as_deref().map(|j| format!(" via {j}")).unwrap_or_default();
+        let selectors = i.selectors.clone().unwrap_or_default().join(", ");
+        println!(
+            "  {:<20} {:<16}{}  {}@{}  [{}]",
+            i.name,
+            address,
+            via,
+            i.ssh_username.as_deref().unwrap_or("—"),
+            i.project_id,
+            selectors
+        );
+    }
+    Ok(())
+}
+
+fn infra_import(source: &PathBuf, profile_ref: &str, force: bool) -> Result<()> {
+    let (profile, store) = open_store(profile_ref)?;
+    println!("✓ Profile '{}' loaded", profile.name);
+    println!("📂 Target: {}", store.type_dir(bigbang::infra::TYPE_INFRASTRUCTURE).display());
+    let outcome = bigbang::infra::import(&store, source, force)?;
+
+    for name in &outcome.imported {
+        println!("  ✓ {name}");
+    }
+    for item in &outcome.skipped {
+        println!("  ⊘ {item}");
+    }
+    for (file, err) in &outcome.errors {
+        println!("  ✗ {file}: {err}");
+    }
+    println!(
+        "📊 Imported: {}  Skipped: {}  Errors: {}",
+        outcome.imported.len(),
+        outcome.skipped.len(),
+        outcome.errors.len()
+    );
+
+    // A partial import is a failure: the inventory is now neither what it was nor what was asked
+    // for, and exiting 0 would let a pipeline carry on against machines that were never written.
+    if !outcome.errors.is_empty() {
+        anyhow::bail!("{} definition(s) could not be imported", outcome.errors.len());
+    }
+    if outcome.imported.is_empty() && outcome.skipped.is_empty() {
+        anyhow::bail!("Nothing was imported — no .json definitions found in {}", source.display());
+    }
+    Ok(())
 }
 
 fn recipe_list(profile_ref: &str) -> Result<()> {

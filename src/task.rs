@@ -99,6 +99,68 @@ impl TaskCommand {
     }
 }
 
+/// A package: metadata plus an ordered list of task references.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageDefinition {
+    #[serde(default)]
+    pub group: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub selectors: Vec<String>,
+    #[serde(default)]
+    pub tasks: Vec<PackageRef>,
+}
+
+/// Both forms occur in this repository: some packages list bare coordinate strings, others list
+/// objects carrying `path` alongside a name, order and an `optional` flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PackageRef {
+    Simple(String),
+    Detailed {
+        path: String,
+        #[serde(default)]
+        order: Option<i64>,
+        #[serde(default)]
+        optional: Option<bool>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+    },
+}
+
+impl PackageRef {
+    pub fn path(&self) -> &str {
+        match self {
+            PackageRef::Simple(p) => p,
+            PackageRef::Detailed { path, .. } => path,
+        }
+    }
+    /// Unordered references keep their file order by sorting after everything numbered.
+    pub fn order(&self) -> i64 {
+        match self {
+            PackageRef::Simple(_) => i64::MAX,
+            PackageRef::Detailed { order, .. } => order.unwrap_or(i64::MAX),
+        }
+    }
+}
+
+impl PackageDefinition {
+    pub fn load_file(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
 impl TaskDefinition {
     /// `libraryRoot/group/name/version/task.json`
     pub fn load_from_library(library_root: &Path, coordinate: &str) -> Result<Self> {
@@ -106,15 +168,86 @@ impl TaskDefinition {
         if parts.len() != 3 {
             anyhow::bail!("package coordinate must be group/name/version, got '{coordinate}'");
         }
-        let dir = library_root.join(parts[0]).join(parts[1]).join(parts[2]);
-        // The file is named after its type; task is the only one execution loads.
-        for candidate in ["task.json", "package.json"] {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Self::load_file(&path);
-            }
+        Self::load_from_library_guarded(library_root, coordinate, &mut Vec::new())
+    }
+
+    /// A package is a *list of task references*, not a list of commands.
+    ///
+    /// Loading `package.json` straight into a `TaskDefinition` used to "work": its `tasks` entries
+    /// carry `path`/`order`/`optional` and no `commands`, so every one deserialized to an empty
+    /// command list and the recipe reported success having run nothing at all. Eight of the
+    /// fifteen recipes in this repository reach their work through a package — including the
+    /// application deployment, the database provisioning and the load balancer — so the failure
+    /// was both silent and total.
+    ///
+    /// A package is therefore expanded: each referenced coordinate is loaded in `order` and its
+    /// tasks are concatenated. Package variables become defaults, overridden by the task's own.
+    fn load_from_library_guarded(
+        library_root: &Path,
+        coordinate: &str,
+        seen: &mut Vec<String>,
+    ) -> Result<Self> {
+        if seen.iter().any(|c| c == coordinate) {
+            anyhow::bail!(
+                "package cycle: {} -> {coordinate}",
+                seen.join(" -> ")
+            );
         }
-        anyhow::bail!("no task.json or package.json under {}", dir.display())
+        seen.push(coordinate.to_string());
+
+        let parts: Vec<&str> = coordinate.split('/').collect();
+        if parts.len() != 3 {
+            anyhow::bail!("package coordinate must be group/name/version, got '{coordinate}'");
+        }
+        let dir = library_root.join(parts[0]).join(parts[1]).join(parts[2]);
+
+        let task_path = dir.join("task.json");
+        if task_path.exists() {
+            return Self::load_file(&task_path);
+        }
+
+        let package_path = dir.join("package.json");
+        if !package_path.exists() {
+            anyhow::bail!("no task.json or package.json under {}", dir.display());
+        }
+
+        let package = PackageDefinition::load_file(&package_path)?;
+        let mut refs: Vec<&PackageRef> = package.tasks.iter().collect();
+        refs.sort_by_key(|r| r.order());
+
+        let mut expanded = TaskDefinition {
+            group: package.group.clone(),
+            name: package.name.clone(),
+            version: package.version.clone(),
+            description: package.description.clone(),
+            variables: package.variables.clone(),
+            environment: package.environment.clone(),
+            selectors: package.selectors.clone(),
+            tasks: Vec::new(),
+        };
+        for reference in refs {
+            let child = Self::load_from_library_guarded(library_root, reference.path(), seen)?
+                ;
+            // The package's own variables are defaults; a referenced task's win where they collide.
+            for (k, v) in child.variables {
+                expanded.variables.insert(k, v);
+            }
+            for (k, v) in child.environment {
+                expanded.environment.insert(k, v);
+            }
+            expanded.tasks.extend(child.tasks);
+        }
+
+        // A package that expands to nothing is a broken package, not an empty job. Returning it
+        // silently is precisely the failure this function exists to end.
+        if expanded.tasks.is_empty() {
+            anyhow::bail!(
+                "package {coordinate} expanded to no tasks — it references {} item(s) that contain none",
+                package.tasks.len()
+            );
+        }
+        seen.pop();
+        Ok(expanded)
     }
 
     pub fn load_file(path: &Path) -> Result<Self> {
@@ -126,6 +259,43 @@ impl TaskDefinition {
         let parts: Vec<&str> = coordinate.split('/').collect();
         parts.iter().fold(library_root.to_path_buf(), |acc, p| acc.join(p))
     }
+}
+
+/// Substitute variable values into one another until nothing changes.
+///
+/// A variable's *value* may name another variable: `postgres_config_dir` is
+/// `/etc/postgresql/${postgres_major_version}/main`, because the major version is the knob anyone
+/// would actually turn. Substituting a command in a single pass expanded the outer name and left
+/// the inner one intact, so the shell received the literal `${postgres_major_version}` and `cp`
+/// failed on a path that cannot exist.
+///
+/// Bounded rather than recursive: two variables naming each other would otherwise spin forever. On
+/// reaching the bound the values stand as they are, so an unresolved placeholder reaches the host
+/// and fails loudly — the right direction, since blanking it would silently aim a command at the
+/// wrong path.
+pub fn resolve_nested(mut vars: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    const MAX_PASSES: usize = 10;
+    for _ in 0..MAX_PASSES {
+        let mut changed = false;
+        let snapshot = vars.clone();
+        for (key, value) in vars.iter_mut() {
+            if !value.contains("${") {
+                continue;
+            }
+            // A variable must not expand itself; leaving it be keeps the failure legible.
+            let mut without_self = snapshot.clone();
+            without_self.remove(key);
+            let resolved = substitute(value, &without_self);
+            if &resolved != value {
+                *value = resolved;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vars
 }
 
 /// Replaces `${name}` from the merged variable map.
@@ -195,5 +365,90 @@ mod tests {
         assert_eq!(substitute("echo $HOME", &vars()), "echo $HOME");
         assert_eq!(substitute("echo ${unclosed", &vars()), "echo ${unclosed");
         assert_eq!(substitute("cost: 5$", &vars()), "cost: 5$");
+    }
+
+    fn write_library(root: &Path, coordinate: &str, file: &str, body: &str) {
+        let parts: Vec<&str> = coordinate.split('/').collect();
+        let dir = root.join(parts[0]).join(parts[1]).join(parts[2]);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), body).unwrap();
+    }
+
+    /// The regression that mattered: a package used to load as a `TaskDefinition` whose `tasks`
+    /// entries carried `path` and no `commands`, so it ran nothing and reported success.
+    #[test]
+    fn a_package_expands_into_the_commands_of_the_tasks_it_references() {
+        let root = std::env::temp_dir().join(format!("bigbang-pkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        write_library(
+            &root,
+            "g/install/1.0",
+            "task.json",
+            r#"{"name":"install","variables":{"port":"5432"},
+                "tasks":[{"name":"Install","runAs":"root","commands":["apt-get install -y postgresql"]}]}"#,
+        );
+        write_library(
+            &root,
+            "g/configure/1.0",
+            "task.json",
+            r#"{"name":"configure",
+                "tasks":[{"name":"Configure","runAs":"root","commands":[{"cmd":"systemctl restart postgresql"}]}]}"#,
+        );
+        // Deliberately out of order in the file, to prove `order` is what decides.
+        write_library(
+            &root,
+            "g/setup/1.0",
+            "package.json",
+            r#"{"name":"setup","variables":{"port":"1111","extra":"x"},
+                "tasks":[{"path":"g/configure/1.0","order":2},{"path":"g/install/1.0","order":1}]}"#,
+        );
+
+        let def = TaskDefinition::load_from_library(&root, "g/setup/1.0").unwrap();
+
+        let commands: usize = def.tasks.iter().map(|t| t.commands.len()).sum();
+        assert_eq!(def.tasks.len(), 2, "both referenced tasks must appear");
+        assert_eq!(commands, 2, "a package must contribute its tasks' commands, not zero");
+        assert_eq!(def.tasks[0].name, "Install", "order decides, not file position");
+        assert_eq!(def.tasks[1].name, "Configure");
+        // runAs has to survive expansion, or every elevated command silently drops to the login user.
+        assert_eq!(def.tasks[0].run_as.as_deref(), Some("root"));
+        // A referenced task's variables win over the package's defaults.
+        assert_eq!(def.variables.get("port").map(String::as_str), Some("5432"));
+        assert_eq!(def.variables.get("extra").map(String::as_str), Some("x"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_package_that_expands_to_nothing_is_an_error_not_an_empty_run() {
+        let root = std::env::temp_dir().join(format!("bigbang-pkg-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write_library(&root, "g/hollow/1.0", "task.json", r#"{"name":"hollow","tasks":[]}"#);
+        write_library(
+            &root,
+            "g/empty/1.0",
+            "package.json",
+            r#"{"name":"empty","tasks":[{"path":"g/hollow/1.0","order":1}]}"#,
+        );
+        let err = TaskDefinition::load_from_library(&root, "g/empty/1.0").unwrap_err();
+        assert!(format!("{err:#}").contains("expanded to no tasks"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_package_cycle_is_refused_rather_than_recursing_forever() {
+        // The directory must not contain the word this test asserts on: errors embed the path, so
+        // naming the temp dir "…-cycle-…" made this assertion pass against a build with no cycle
+        // detection at all. It matched the folder name, not the diagnosis.
+        let root = std::env::temp_dir().join(format!("bigbang-pkg-loop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write_library(&root, "g/a/1.0", "package.json", r#"{"name":"a","tasks":["g/b/1.0"]}"#);
+        write_library(&root, "g/b/1.0", "package.json", r#"{"name":"b","tasks":["g/a/1.0"]}"#);
+        let err = format!("{:#}", TaskDefinition::load_from_library(&root, "g/a/1.0").unwrap_err());
+        assert!(err.contains("package cycle"), "expected a cycle diagnosis, got: {err}");
+        // The chain has to name the path taken, or the message cannot be acted on.
+        assert!(err.contains("g/a/1.0") && err.contains("g/b/1.0"), "got: {err}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

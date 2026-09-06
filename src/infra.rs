@@ -253,6 +253,13 @@ pub fn ssh_target_for(
 }
 
 /// Variables merged in the order the executor applies them: definition, then recipe, then role.
+///
+/// Values are then resolved against each other, because a variable's *value* may itself reference
+/// another variable — `postgres_config_dir` is `/etc/postgresql/${postgres_major_version}/main`,
+/// and the major version is the knob that is meant to be changed. Substituting a command in one
+/// pass expanded the outer name and left the inner one untouched, so the literal string
+/// `${postgres_major_version}` was handed to the shell and `cp` failed on a path that does not
+/// exist. Resolving here means every caller of `substitute` gets flat values.
 pub fn merge_variables(layers: &[&BTreeMap<String, String>]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for layer in layers {
@@ -260,7 +267,113 @@ pub fn merge_variables(layers: &[&BTreeMap<String, String>]) -> BTreeMap<String,
             out.insert(k.clone(), v.clone());
         }
     }
-    out
+    crate::task::resolve_nested(out)
+}
+
+// ── importing ──────────────────────────────────────────────────────────────────
+
+/// Refuse an instance that would only fail once a run is under way.
+///
+/// Every check here corresponds to a failure that is cheap to catch now and expensive to catch
+/// later: a missing key reference surfaces as an ssh error halfway through a recipe, and a missing
+/// address surfaces as `no IP address for instance` after the store has already been changed. An
+/// inventory is read far more often than it is written, so the strictness belongs at write time.
+pub fn validate(instance: &Instance) -> Result<()> {
+    if instance.id.trim().is_empty() {
+        bail!("'id' is required");
+    }
+    if instance.name.trim().is_empty() {
+        bail!("'name' is required");
+    }
+    if instance.project_id.trim().is_empty() {
+        // A recipe resolves roles within one project; an instance with no project is invisible to
+        // every recipe, which looks exactly like a recipe that matched nothing.
+        bail!("'projectId' is required — an instance without one matches no recipe role");
+    }
+    if instance.is_local() {
+        return Ok(());
+    }
+    if instance.public_ip.is_none() && instance.private_ip.is_none() {
+        bail!("needs 'publicIpAddress' or 'privateIpAddress'");
+    }
+    match instance.ssh_username.as_deref() {
+        Some(u) if !u.trim().is_empty() => {}
+        _ => bail!("'sshUsername' is required"),
+    }
+    match instance.ssh_key_id.as_deref() {
+        Some(k) if k.starts_with("file:") || k.starts_with("vault:") => {}
+        Some(k) => bail!("'sshKeyId' must start with 'file:' or 'vault:', got '{k}'"),
+        None => bail!("'sshKeyId' is required"),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct ImportOutcome {
+    pub imported: Vec<String>,
+    pub skipped: Vec<String>,
+    pub errors: Vec<(String, String)>,
+}
+
+/// Read instance definitions from a file or a directory and write them into the store.
+///
+/// This exists because infrastructure was the one object type the CLI could read but never write:
+/// the Kotlin app created instances through its own UI, so an environment could be *used*
+/// reproducibly but never *rebuilt* reproducibly. An inventory that lives only in one laptop's
+/// store is not an inventory, it is a local accident.
+pub fn import(store: &RepoDb, source: &std::path::Path, force: bool) -> Result<ImportOutcome> {
+    let mut files = Vec::new();
+    if source.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(source)
+            .with_context(|| format!("reading {}", source.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        entries.sort();
+        files.extend(entries);
+    } else {
+        files.push(source.to_path_buf());
+    }
+
+    let mut outcome = ImportOutcome::default();
+    for file in files {
+        let label = file.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(err) => {
+                outcome.errors.push((label, err.to_string()));
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(err) => {
+                outcome.errors.push((label, format!("not valid JSON: {err}")));
+                continue;
+            }
+        };
+        let instance: Instance = match serde_json::from_value(value.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                outcome.errors.push((label, format!("not an instance: {err}")));
+                continue;
+            }
+        };
+        if let Err(err) = validate(&instance) {
+            outcome.errors.push((label, format!("{err:#}")));
+            continue;
+        }
+        if store.exists(TYPE_INFRASTRUCTURE, &instance.name) && !force {
+            outcome.skipped.push(format!("{} (already present; --force to replace)", instance.name));
+            continue;
+        }
+        match store.write(TYPE_INFRASTRUCTURE, &instance.name, &value) {
+            Ok(_) => outcome.imported.push(instance.name.clone()),
+            Err(err) => outcome.errors.push((label, format!("{err:#}"))),
+        }
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -372,6 +485,139 @@ mod tests {
         // "Load key: invalid format", which sends you looking in the wrong place.
         let err = resolve_ssh_key("vault:a/b/c", "/nonexistent", &|| Ok("pw".to_string())).unwrap_err();
         assert!(format!("{err:#}").contains("not found") || format!("{err:#}").contains("No such file"));
+    }
+
+    #[test]
+    fn validation_refuses_what_would_fail_mid_run() {
+        let mut ok = instance("db", &["database-server"], None);
+        ok.ssh_key_id = Some("file:~/.ssh/colistor-int".into());
+        assert!(validate(&ok).is_ok());
+
+        // A key reference that is neither file: nor vault: reaches ssh as a literal path.
+        let mut bad_key = ok.clone();
+        bad_key.ssh_key_id = Some("/home/joel/.ssh/id_rsa".into());
+        assert!(format!("{:#}", validate(&bad_key).unwrap_err()).contains("file:"));
+
+        let mut no_key = ok.clone();
+        no_key.ssh_key_id = None;
+        assert!(validate(&no_key).is_err());
+
+        // No project means every recipe role resolves to nothing — indistinguishable, at the
+        // console, from a recipe that simply matched no machine.
+        let mut no_project = ok.clone();
+        no_project.project_id = String::new();
+        assert!(format!("{:#}", validate(&no_project).unwrap_err()).contains("projectId"));
+
+        let mut no_address = ok.clone();
+        no_address.public_ip = None;
+        no_address.private_ip = None;
+        assert!(validate(&no_address).is_err());
+
+        // LOCAL has no host to reach, so none of the ssh fields apply to it.
+        let mut local = instance("here", &[], None);
+        local.instance_type = Some("LOCAL".into());
+        local.public_ip = None;
+        local.private_ip = None;
+        local.ssh_username = None;
+        local.ssh_key_id = None;
+        assert!(validate(&local).is_ok());
+    }
+
+    #[test]
+    fn import_writes_an_instance_that_reads_back() {
+        let dir = std::env::temp_dir().join(format!("bigbang-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("int-base-1.json");
+        std::fs::write(
+            &source,
+            r#"{"id":"int-base-1","name":"int-base-1","projectId":"proj-1",
+                "publicIpAddress":"203.0.113.9","sshUsername":"debian",
+                "sshKeyId":"file:~/.ssh/colistor-int","selectors":["vps"]}"#,
+        )
+        .unwrap();
+
+        let store = RepoDb::new(dir.join("store"), "colistor", "repo-int");
+        let outcome = import(&store, &source, false).unwrap();
+        assert_eq!(outcome.imported, vec!["int-base-1".to_string()]);
+        assert!(outcome.errors.is_empty());
+
+        // The point of the round-trip: what was written is what the executor will later resolve.
+        let loaded = load_instances(&store).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].address().unwrap(), "203.0.113.9");
+        assert_eq!(loaded[0].ssh_username.as_deref(), Some("debian"));
+
+        // A second import must not silently replace an inventory entry.
+        let again = import(&store, &source, false).unwrap();
+        assert!(again.imported.is_empty());
+        assert_eq!(again.skipped.len(), 1);
+
+        let forced = import(&store, &source, true).unwrap();
+        assert_eq!(forced.imported.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_rejects_a_bad_definition_without_writing_it() {
+        let dir = std::env::temp_dir().join(format!("bigbang-import-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("broken.json");
+        // Valid JSON, parses as an Instance, but has no usable key reference.
+        std::fs::write(
+            &source,
+            r#"{"id":"x","name":"x","projectId":"proj-1","publicIpAddress":"203.0.113.9",
+                "sshUsername":"debian","sshKeyId":"/plain/path"}"#,
+        )
+        .unwrap();
+
+        let store = RepoDb::new(dir.join("store"), "colistor", "repo-int");
+        let outcome = import(&store, &source, false).unwrap();
+        assert!(outcome.imported.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        // The store must be untouched, not left holding a half-valid entry.
+        assert!(load_instances(&store).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_variable_whose_value_names_another_variable_is_resolved() {
+        // The real case: the config directory is written in terms of the major version, which is
+        // the value anyone would actually change. One-pass substitution sent the literal
+        // "${postgres_major_version}" to the shell and cp failed on a path that cannot exist.
+        let mut defaults = BTreeMap::new();
+        defaults.insert("postgres_major_version".to_string(), "17".to_string());
+        defaults.insert(
+            "postgres_config_dir".to_string(),
+            "/etc/postgresql/${postgres_major_version}/main".to_string(),
+        );
+        let merged = merge_variables(&[&defaults]);
+        assert_eq!(merged["postgres_config_dir"], "/etc/postgresql/17/main");
+
+        // And a later layer overriding the inner value must move the outer one with it.
+        let mut override_major = BTreeMap::new();
+        override_major.insert("postgres_major_version".to_string(), "16".to_string());
+        let merged = merge_variables(&[&defaults, &override_major]);
+        assert_eq!(merged["postgres_config_dir"], "/etc/postgresql/16/main");
+    }
+
+    #[test]
+    fn a_self_referencing_variable_does_not_hang() {
+        let mut vars = BTreeMap::new();
+        vars.insert("a".to_string(), "${b}".to_string());
+        vars.insert("b".to_string(), "${a}".to_string());
+        // The contract is only that it terminates and leaves something unresolved rather than
+        // inventing a value.
+        let merged = merge_variables(&[&vars]);
+        assert!(merged["a"].contains("${") || merged["b"].contains("${"));
+
+        let mut me = BTreeMap::new();
+        me.insert("x".to_string(), "${x}/sub".to_string());
+        let merged = merge_variables(&[&me]);
+        assert_eq!(merged["x"], "${x}/sub");
     }
 
     #[test]
