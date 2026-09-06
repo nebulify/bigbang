@@ -24,6 +24,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 jsonschema = { version = "0.26", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rand = "0.8"
+# Assertion patterns: MATCHES / NOT_MATCHES are regular expressions.
+regex = "1"
 # Vault crypto, matching javax.crypto exactly: PBKDF2WithHmacSHA256 -> AES/GCM/NoPadding.
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }

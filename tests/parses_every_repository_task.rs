@@ -55,6 +55,65 @@ fn every_task_definition_in_the_repository_parses() {
     eprintln!("parsed {parsed} task definitions, {commands} commands");
 }
 
+/// The assertions written in the repository must reach the model.
+///
+/// They were declared for a long time and silently dropped: `DetailedCommand` had no such field,
+/// so serde discarded them without complaint and every "output must not contain ERROR" check was
+/// inert. A count asserted here means the field cannot quietly disappear again.
+#[test]
+fn assertions_in_repository_definitions_are_not_dropped() {
+    let dir = tasks_dir();
+    if !dir.exists() {
+        eprintln!("skipping: {} not present", dir.display());
+        return;
+    }
+
+    let mut total = 0usize;
+    let mut files_with = Vec::new();
+
+    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        // Only count what the raw file actually declares, so this compares model against file.
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        if !raw.contains("\"assertions\"") {
+            continue;
+        }
+        let def = TaskDefinition::load_file(&path).expect("a file with assertions must parse");
+        let parsed: usize = def
+            .tasks
+            .iter()
+            .flat_map(|t| t.commands.iter())
+            .map(|c| c.detail().assertions.len())
+            .sum();
+        assert!(
+            parsed > 0,
+            "{} declares assertions but the model parsed none",
+            path.display()
+        );
+        // Every one must be a type the executor understands, or it is a check that cannot pass.
+        for task in &def.tasks {
+            for command in &task.commands {
+                for assertion in &command.detail().assertions {
+                    let err = assertion.evaluate("").err().unwrap_or_default();
+                    assert!(
+                        !err.contains("unknown assertion type"),
+                        "{}: {}",
+                        path.display(), err
+                    );
+                }
+            }
+        }
+        total += parsed;
+        files_with.push(path.file_name().unwrap().to_string_lossy().to_string());
+    }
+
+    assert!(total > 0, "expected the repository's declared assertions to parse, found none");
+    eprintln!("parsed {total} assertion(s) across {}", files_with.join(", "));
+}
+
 /// No task may bring a firewall up without a way back in.
 ///
 /// `setup-postgresql-firewall` enabled UFW as its second step and only then tried to add SSH

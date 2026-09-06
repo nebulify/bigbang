@@ -88,6 +88,84 @@ pub struct DetailedCommand {
     pub run_if: Option<String>,
     #[serde(rename = "expectExitCode", default)]
     pub expect_exit_code: Option<i32>,
+    /// Checks against the command's combined output, applied when the command is otherwise
+    /// considered to have succeeded.
+    #[serde(default)]
+    pub assertions: Vec<Assertion>,
+}
+
+/// A check on what a command printed, not on what it returned.
+///
+/// This exists because an exit code is often not the truth: `psql` will exit 0 having printed
+/// `ERROR: relation already exists`, and `kubectl` will exit 0 on `NotFound` in several paths. The
+/// definitions in this repository have declared assertions for a long time; the model simply had no
+/// field for them, so serde dropped them silently and every one of these checks was inert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assertion {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(rename = "caseSensitive", default = "default_case_sensitive")]
+    pub case_sensitive: bool,
+}
+
+fn default_case_sensitive() -> bool {
+    true
+}
+
+impl Assertion {
+    /// `Ok(())` when the assertion holds; `Err(reason)` when it does not.
+    ///
+    /// An unrecognised type is a failure rather than a pass. Treating it as satisfied would
+    /// reintroduce exactly the fault this feature had — a check that is written down, looks
+    /// enforced, and silently is not.
+    pub fn evaluate(&self, output: &str) -> Result<(), String> {
+        let describe = |verdict: &str| {
+            let msg = self.message.as_deref().unwrap_or("assertion failed");
+            format!("{msg} ({verdict}: {} {:?})", self.type_, self.pattern)
+        };
+
+        match self.type_.to_ascii_uppercase().as_str() {
+            "CONTAINS" | "NOT_CONTAINS" => {
+                let found = if self.case_sensitive {
+                    output.contains(&self.pattern)
+                } else {
+                    output.to_lowercase().contains(&self.pattern.to_lowercase())
+                };
+                let want = self.type_.to_ascii_uppercase() == "CONTAINS";
+                if found == want {
+                    Ok(())
+                } else if want {
+                    Err(describe("output does not contain"))
+                } else {
+                    Err(describe("output contains"))
+                }
+            }
+            "MATCHES" | "NOT_MATCHES" => {
+                let pattern = if self.case_sensitive {
+                    self.pattern.clone()
+                } else {
+                    format!("(?i){}", self.pattern)
+                };
+                let re = regex::Regex::new(&pattern)
+                    .map_err(|e| format!("assertion pattern is not a valid regex: {e}"))?;
+                let found = re.is_match(output);
+                let want = self.type_.to_ascii_uppercase() == "MATCHES";
+                if found == want {
+                    Ok(())
+                } else if want {
+                    Err(describe("output does not match"))
+                } else {
+                    Err(describe("output matches"))
+                }
+            }
+            other => Err(format!(
+                "unknown assertion type '{other}' — refusing to treat an unrecognised check as passed"
+            )),
+        }
+    }
 }
 
 impl TaskCommand {

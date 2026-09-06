@@ -240,6 +240,18 @@ fn run_task(
         let result = run_with_retries(&detail, &rendered, executor)?;
         let expected = detail.expect_exit_code.unwrap_or(0);
         if result.exit_code == expected {
+            // The exit code is often not the truth: psql exits 0 having printed
+            // "ERROR: ... already exists". Assertions are checked on the success path precisely
+            // because that is the case they exist to catch.
+            if let Some(reason) = failed_assertion(&detail, &result.output) {
+                let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
+                if tolerated {
+                    outcome.ran.push(rendered);
+                    continue;
+                }
+                outcome.failed = Some(format!("{rendered}: {reason}"));
+                return Ok(outcome);
+            }
             outcome.ran.push(rendered);
             continue;
         }
@@ -262,6 +274,14 @@ fn run_task(
         }
     }
     Ok(outcome)
+}
+
+/// The first assertion that does not hold, if any.
+fn failed_assertion(detail: &DetailedCommand, output: &str) -> Option<String> {
+    detail
+        .assertions
+        .iter()
+        .find_map(|a| a.evaluate(output).err())
 }
 
 /// `skipIf` succeeding means the work is already done; `runIf` failing means it does not apply.
@@ -320,11 +340,14 @@ mod tests {
         seen: Vec<String>,
         answers: BTreeMap<String, i32>,
         default_code: i32,
+        /// What the next command prints. Assertions read output, so a fake that always returns
+        /// nothing cannot exercise them.
+        next_output: Option<String>,
     }
 
     impl Fake {
         fn new(default_code: i32) -> Self {
-            Self { seen: Vec::new(), answers: BTreeMap::new(), default_code }
+            Self { seen: Vec::new(), answers: BTreeMap::new(), default_code, next_output: None }
         }
         fn answer(mut self, command: &str, code: i32) -> Self {
             self.answers.insert(command.to_string(), code);
@@ -336,7 +359,8 @@ mod tests {
         fn run(&mut self, command: &str, _timeout: u64) -> Result<CommandResult> {
             self.seen.push(command.to_string());
             let code = *self.answers.get(command).unwrap_or(&self.default_code);
-            Ok(CommandResult { exit_code: code, output: String::new() })
+            let output = self.next_output.clone().unwrap_or_default();
+            Ok(CommandResult { exit_code: code, output })
         }
     }
 
@@ -399,6 +423,107 @@ mod tests {
         let mut fake = Fake::new(0);
         run_definition(&definition, &overrides, &mut fake).unwrap();
         assert!(fake.seen[0].contains("/etc/postgresql/16/main"), "got: {}", fake.seen[0]);
+    }
+
+    fn asserting(cmd: &str, assertions: Vec<crate::task::Assertion>) -> TaskCommand {
+        TaskCommand::Detailed(DetailedCommand { cmd: cmd.into(), assertions, ..Default::default() })
+    }
+
+    fn assertion(type_: &str, pattern: &str, case_sensitive: bool) -> crate::task::Assertion {
+        crate::task::Assertion {
+            type_: type_.into(),
+            pattern: pattern.into(),
+            message: Some(format!("{type_} {pattern}")),
+            case_sensitive,
+        }
+    }
+
+    /// The whole point: psql exits 0 having printed an error, so the exit code says success.
+    #[test]
+    fn an_assertion_fails_a_command_that_exited_zero_with_an_error_in_its_output() {
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("ERROR:  database \"appdb\" already exists".into());
+        let cmd = asserting("createdb appdb", vec![assertion("NOT_CONTAINS", "ERROR", true)]);
+
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        let failure = outcome.failed.expect("a zero exit with ERROR in the output must fail");
+        assert!(failure.contains("NOT_CONTAINS"), "got: {failure}");
+        assert!(outcome.ran.is_empty(), "a failed assertion must not count as a command that ran");
+    }
+
+    #[test]
+    fn assertions_that_hold_let_the_command_pass() {
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("secret/regcred created".into());
+        let cmd = asserting(
+            "kubectl create secret",
+            vec![
+                assertion("CONTAINS", "created", true),
+                assertion("NOT_CONTAINS", "NotFound", true),
+                assertion("MATCHES", r"secret/\w+ created", true),
+            ],
+        );
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        assert!(outcome.failed.is_none(), "unexpected failure: {:?}", outcome.failed);
+        assert_eq!(outcome.ran.len(), 1);
+    }
+
+    #[test]
+    fn case_insensitivity_is_honoured_for_both_contains_and_matches() {
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("Error: something went wrong".into());
+        // caseSensitive false must catch "Error" with the pattern "ERROR".
+        let cmd = asserting("cmd", vec![assertion("NOT_CONTAINS", "ERROR", false)]);
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        assert!(outcome.failed.is_some(), "case-insensitive NOT_CONTAINS should have matched");
+
+        // And case-sensitively, it must not.
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("Error: something went wrong".into());
+        let cmd = asserting("cmd", vec![assertion("NOT_CONTAINS", "ERROR", true)]);
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        assert!(outcome.failed.is_none(), "case-sensitive NOT_CONTAINS should not have matched");
+
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("FAILED".into());
+        let cmd = asserting("cmd", vec![assertion("NOT_MATCHES", ".*(error|failed).*", false)]);
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        assert!(outcome.failed.is_some(), "case-insensitive NOT_MATCHES should have matched");
+    }
+
+    /// An unrecognised type must not be treated as satisfied — that is the fault this whole
+    /// feature had, and re-creating it inside the feature would be worse than not having it.
+    #[test]
+    fn an_unknown_assertion_type_fails_rather_than_passing_quietly() {
+        let mut fake = Fake::new(0);
+        fake.next_output = Some("anything".into());
+        let cmd = asserting("cmd", vec![assertion("ENDS_WITH", "x", true)]);
+        let outcome = run_task(&task(vec![cmd]), &BTreeMap::new(), &mut fake).unwrap();
+        let failure = outcome.failed.expect("an unknown assertion type must fail");
+        assert!(failure.contains("unknown assertion type"), "got: {failure}");
+    }
+
+    /// The definitions in the repository must actually reach the model now.
+    #[test]
+    fn assertions_declared_in_a_repository_definition_are_parsed() {
+        let json = r#"{
+            "name": "d",
+            "tasks": [{
+              "name": "t",
+              "commands": [{
+                "cmd": "createdb x",
+                "assertions": [
+                  {"type": "NOT_CONTAINS", "pattern": "ERROR", "message": "should succeed"},
+                  {"type": "CONTAINS", "pattern": "created", "message": "m", "caseSensitive": false}
+                ]
+              }]
+            }]
+        }"#;
+        let def: crate::task::TaskDefinition = serde_json::from_str(json).unwrap();
+        let detail = def.tasks[0].commands[0].detail();
+        assert_eq!(detail.assertions.len(), 2, "assertions must survive deserialization");
+        assert!(detail.assertions[0].case_sensitive, "caseSensitive defaults to true");
+        assert!(!detail.assertions[1].case_sensitive);
     }
 
     #[test]
