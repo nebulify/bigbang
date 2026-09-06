@@ -267,27 +267,49 @@ pub fn override_env_name(key: &str) -> String {
 /// The point of 1 and 2 is that a recipe written with `vault:` references — the right thing on a
 /// laptop — runs unchanged in CI, where no vault exists and GitHub holds the secret. One recipe,
 /// no branching inside it on where it thinks it is running, and the vault never leaves the laptop.
+/// Resolved variables, and which of them are secret.
+///
+/// Only values that came from somewhere secret are masked in output: a `vault:` or `env:`
+/// reference, or a BIGBANG_VAR_ override, which is how CI supplies a secret. A literal written in
+/// the recipe, or passed with `--var`, is not masked — `--var` is visible in `ps` anyway, so
+/// treating it as secret buys nothing and costs a great deal of legibility. Masking everything
+/// turned "REFUSING: expected colistor-prod" into "REFUSING: expected ***", which is exactly the
+/// line an operator needs to read.
+#[derive(Debug, Default)]
+pub struct Resolved {
+    pub values: BTreeMap<String, String>,
+    pub secrets: Vec<String>,
+}
+
 pub fn resolve_all(
     variables: &BTreeMap<String, serde_json::Value>,
     vault_root: &str,
     password: &dyn Fn() -> anyhow::Result<String>,
     overrides: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
+) -> Result<Resolved> {
+    let mut out = Resolved::default();
     for (key, value) in variables {
         if let Some(supplied) = overrides.get(key) {
-            out.insert(key.clone(), supplied.clone());
+            out.values.insert(key.clone(), supplied.clone());
             continue;
         }
         if let Ok(from_env) = std::env::var(override_env_name(key)) {
             if !from_env.is_empty() {
-                out.insert(key.clone(), from_env);
+                out.secrets.push(from_env.clone());
+                out.values.insert(key.clone(), from_env);
                 continue;
             }
         }
+        let declared = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
         let resolved = resolve_value(value, vault_root, password)
             .with_context(|| format!("resolving variable '{key}'"))?;
-        out.insert(key.clone(), resolved);
+        if declared.starts_with("vault:") || declared.starts_with("env:") {
+            out.secrets.push(resolved.clone());
+        }
+        out.values.insert(key.clone(), resolved);
     }
     Ok(out)
 }
@@ -342,7 +364,8 @@ mod value_tests {
         let mut overrides = BTreeMap::new();
         overrides.insert("db_password".to_string(), "supplied".to_string());
         let out = resolve_all(&vars, "/nonexistent", &no_password, &overrides).unwrap();
-        assert_eq!(out["db_password"], "supplied");
+        assert_eq!(out.values["db_password"], "supplied");
+        assert!(out.secrets.is_empty(), "--var is not a secret channel: it is visible in ps");
     }
 
     #[test]
@@ -354,7 +377,8 @@ mod value_tests {
         vars.insert("db_password".to_string(), serde_json::json!("vault:a/b/c"));
         std::env::set_var("BIGBANG_VAR_DB_PASSWORD", "from-ci");
         let out = resolve_all(&vars, "/nonexistent", &no_password, &BTreeMap::new()).unwrap();
-        assert_eq!(out["db_password"], "from-ci");
+        assert_eq!(out.values["db_password"], "from-ci");
+        assert_eq!(out.secrets, vec!["from-ci".to_string()], "an env override is a secret and must be masked");
         std::env::remove_var("BIGBANG_VAR_DB_PASSWORD");
     }
 
@@ -366,7 +390,7 @@ mod value_tests {
         let mut overrides = BTreeMap::new();
         overrides.insert("x".to_string(), "from-flag".to_string());
         let out = resolve_all(&vars, "/v", &no_password, &overrides).unwrap();
-        assert_eq!(out["x"], "from-flag");
+        assert_eq!(out.values["x"], "from-flag");
         std::env::remove_var("BIGBANG_VAR_X");
     }
 }

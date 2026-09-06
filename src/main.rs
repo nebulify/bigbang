@@ -365,7 +365,7 @@ fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, 
 }
 
 fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -> Result<()> {
-    use bigbang::exec::{run_definition, SshExecutor};
+    use bigbang::exec::{run_definition, CommandExecutor, LocalExecutor, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
     use bigbang::recipe::{resolve_all, Recipe};
     use bigbang::task::TaskDefinition;
@@ -396,7 +396,9 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
 
     let vault_root = Profile::expand(&profile.vault_path);
     let password = || vault_password();
-    let recipe_vars = resolve_all(&recipe.variables, &vault_root, &password, &overrides)?;
+    let resolved = resolve_all(&recipe.variables, &vault_root, &password, &overrides)?;
+    let recipe_vars = resolved.values;
+    let mut secret_values = resolved.secrets;
     let instances = load_instances(&store)?;
     let library_root = PathBuf::from(Profile::expand(&profile.library_path));
 
@@ -417,15 +419,20 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
             continue;
         }
 
-        let role_vars = resolve_all(&role.variables, &vault_root, &password, &overrides)?;
+        let role_resolved = resolve_all(&role.variables, &vault_root, &password, &overrides)?;
+        secret_values.extend(role_resolved.secrets.clone());
         let mut merged = recipe_vars.clone();
-        merged.extend(role_vars);
+        merged.extend(role_resolved.values);
 
         let mut items: Vec<_> = role.items.iter().collect();
         items.sort_by_key(|i| i.order.unwrap_or(0));
 
         for instance in &targets {
-            println!("   ▸ {} ({})", instance.name, instance.address()?);
+            if instance.is_local() {
+                println!("   ▸ {} (local)", instance.name);
+            } else {
+                println!("   ▸ {} ({})", instance.name, instance.address()?);
+            }
             for item in &items {
                 let Some(coordinate) = item.package.as_ref().or(item.task.as_ref()) else {
                     println!("     ⚠️  item has neither 'package' nor 'task'; skipped");
@@ -440,16 +447,25 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     continue;
                 }
 
-                let key_id = instance.ssh_key_id.as_deref()
-                    .with_context(|| format!("no sshKeyId on instance {}", instance.name))?;
-                let key = resolve_ssh_key(key_id, &vault_root, &password()?)?;
-                let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
-                // Everything resolved counts as a secret for masking. Over-masking a database
-                // name costs a line of readability; under-masking a password costs the password.
-                let secrets: Vec<String> = merged.values().cloned().collect();
-                let mut executor = SshExecutor { target, echo: true, secrets };
+                // Only genuinely secret values are masked — see recipe::Resolved. Masking every
+                // variable made refusal messages unreadable, which is worse than useless when the
+                // message exists to tell an operator what went wrong.
+                let secrets: Vec<String> = secret_values.clone();
 
-                let outcomes = run_definition(&definition, &merged, &mut executor)?;
+                // A LOCAL host runs here; anything else needs a key and a route.
+                let _key_guard;
+                let mut executor: Box<dyn CommandExecutor> = if instance.is_local() {
+                    Box::new(LocalExecutor { echo: true, secrets })
+                } else {
+                    let key_id = instance.ssh_key_id.as_deref()
+                        .with_context(|| format!("no sshKeyId on instance {}", instance.name))?;
+                    let key = resolve_ssh_key(key_id, &vault_root, &password()?)?;
+                    let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
+                    _key_guard = key; // keep the temporary key file alive for the whole run
+                    Box::new(SshExecutor { target, echo: true, secrets })
+                };
+
+                let outcomes = run_definition(&definition, &merged, executor.as_mut())?;
                 for outcome in &outcomes {
                     if let Some(failure) = &outcome.failed {
                         println!("     ✗ {}: {failure}", outcome.task_name);

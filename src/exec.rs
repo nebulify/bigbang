@@ -112,6 +112,41 @@ impl CommandExecutor for SshExecutor {
     }
 }
 
+/// Runs commands on the machine bigbang itself is running on.
+///
+/// Provisioning has nowhere to SSH to: the instance being created does not exist yet, and in an
+/// empty project there is no host at all. Those commands belong on the operator's machine or the CI
+/// runner, which until now this tool could not express — every executor was SSH.
+///
+/// An inventory entry with `"type": "LOCAL"` selects this. It is deliberately explicit rather than
+/// inferred from an address like 127.0.0.1: "run this on my own machine" should be a stated
+/// property of a host, not a coincidence of how it was written down.
+pub struct LocalExecutor {
+    pub echo: bool,
+    pub secrets: Vec<String>,
+}
+
+impl CommandExecutor for LocalExecutor {
+    fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
+        if self.echo {
+            println!("[local]");
+            println!("$ {}", mask(command, &self.secrets));
+        }
+        // Same shape as the SSH path: `timeout` wraps the whole child rather than a read deadline,
+        // so a command that hangs is killed rather than leaving the process behind.
+        let mut cmd = Command::new("timeout");
+        cmd.arg(timeout_secs.to_string()).arg("sh").arg("-c").arg(command);
+        cmd.stdin(Stdio::null());
+        let out = cmd.output().context("spawning a local command")?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        if self.echo && !text.is_empty() {
+            print!("{}", mask(&text, &self.secrets));
+        }
+        Ok(CommandResult { exit_code: out.status.code().unwrap_or(-1), output: text })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TaskOutcome {
     pub task_name: String,

@@ -21,6 +21,10 @@ pub const TYPE_INFRASTRUCTURE: &str = "infrastructure";
 pub struct Instance {
     #[serde(default)]
     pub id: String,
+    /// `LOCAL` means "run on the machine bigbang is on" — used for provisioning, which has no
+    /// remote host to talk to yet.
+    #[serde(rename = "type", default)]
+    pub instance_type: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(rename = "projectId", default)]
@@ -46,6 +50,10 @@ fn default_port() -> u16 {
 }
 
 impl Instance {
+    pub fn is_local(&self) -> bool {
+        self.instance_type.as_deref() == Some("LOCAL")
+    }
+
     /// Behind a bastion the private address is the only one reachable, and SSH is typically bound
     /// to the private interface — so the presence of a jump host, not a preference, decides which
     /// address is used.
@@ -253,6 +261,7 @@ mod tests {
     fn instance(name: &str, selectors: &[&str], jump: Option<&str>) -> Instance {
         Instance {
             id: format!("id-{name}"),
+            instance_type: None,
             name: name.into(),
             project_id: "proj-1".into(),
             private_ip: Some("10.1.1.9".into()),
@@ -263,6 +272,18 @@ mod tests {
             ssh_key_id: None,
             selectors: Some(selectors.iter().map(|s| s.to_string()).collect()),
         }
+    }
+
+    #[test]
+    fn a_local_host_is_recognised_by_its_declared_type() {
+        let mut host = instance("runner", &["control"], None);
+        assert!(!host.is_local());
+        host.instance_type = Some("LOCAL".into());
+        assert!(host.is_local(), "type LOCAL selects the local executor");
+        // An address that merely looks local is not enough: the intent must be declared.
+        let mut looks_local = instance("looks", &["control"], None);
+        looks_local.private_ip = Some("127.0.0.1".into());
+        assert!(!looks_local.is_local());
     }
 
     #[test]
