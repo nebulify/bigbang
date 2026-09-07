@@ -22,7 +22,6 @@
 //! <vault>/<account>/<project>/.vault-versions/<ts>-<n>-vault.json   pretty-printed array of items
 //! ```
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -204,6 +203,17 @@ pub struct EncryptedPayload {
     pub iv_b64: String,
 }
 
+/// Which on-disk format a vault is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// The Kotlin-compatible format: item list in the clear, each secret encrypted separately.
+    V1,
+    /// One authenticated envelope over everything.
+    V2,
+    /// Nothing on disk yet. New vaults are written as v2.
+    New,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultItem {
     pub id: String,
@@ -290,23 +300,64 @@ impl Vault {
         self.project_dir().join(".vault-versions")
     }
 
-    pub fn read_items(&self) -> Result<Vec<VaultItem>> {
+    /// Which format the vault on disk is in.
+    pub fn format(&self) -> Result<Format> {
+        match self.read_raw()? {
+            None => Ok(Format::New),
+            Some(raw) if crate::vault2::looks_like_v2(&raw) => Ok(Format::V2),
+            Some(_) => Ok(Format::V1),
+        }
+    }
+
+    fn read_raw(&self) -> Result<Option<String>> {
         let pointer = self.project_dir().join("vault.rev");
         if !pointer.exists() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        // The vault pointer holds a bare filename, resolved under .vault-versions — unlike the
-        // RepoDB pointer, which holds a path relative to the type directory.
         let name = fs::read_to_string(&pointer)
             .with_context(|| format!("reading {}", pointer.display()))?;
         let version_file = self.versions_dir().join(name.trim());
-        let raw = fs::read_to_string(&version_file)
-            .with_context(|| format!("reading {}", version_file.display()))?;
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", version_file.display()))
+        Ok(Some(fs::read_to_string(&version_file)
+            .with_context(|| format!("reading {}", version_file.display()))?))
     }
 
+    /// The v2 header, readable without a password. `None` for a v1 or absent vault.
+    pub fn envelope(&self) -> Result<Option<crate::vault2::Envelope>> {
+        match self.read_raw()? {
+            Some(raw) if crate::vault2::looks_like_v2(&raw) => {
+                Ok(Some(serde_json::from_str(&raw).context("parsing the vault envelope")?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The items, decrypting the envelope when the vault is v2.
+    ///
+    /// v1 leaves the item list in the clear and encrypts each secret separately, so it can be read
+    /// without a password. v2 cannot, by design — the names and the policy are inside the envelope.
+    pub fn read_items_with(&self, password: Option<&str>) -> Result<Vec<VaultItem>> {
+        let Some(raw) = self.read_raw()? else { return Ok(Vec::new()) };
+        if crate::vault2::looks_like_v2(&raw) {
+            let envelope: crate::vault2::Envelope =
+                serde_json::from_str(&raw).context("parsing the vault envelope")?;
+            let Some(password) = password else {
+                bail!(
+                    "this vault is encrypted whole, so listing it needs the password — that is the \
+                     point of the format. Unlock it once with: bigbang vault unlock"
+                );
+            };
+            return crate::vault2::open(password, &envelope);
+        }
+        serde_json::from_str(&raw).context("parsing the vault items")
+    }
+
+    pub fn read_items(&self) -> Result<Vec<VaultItem>> {
+        self.read_items_with(None)
+    }
+
+
     pub fn get(&self, item_name: &str, password: &str) -> Result<Option<String>> {
-        let items = self.read_items()?;
+        let items = self.read_items_with(Some(password))?;
         let Some(item) = items.iter().find(|i| i.name == item_name) else {
             return Ok(None);
         };
@@ -506,7 +557,7 @@ impl Vault {
         password: &str,
         metadata: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String> {
-        let mut items = self.read_items()?;
+        let mut items = self.read_items_with(Some(password))?;
         if items.iter().any(|i| i.name == name) {
             bail!("Vault item already exists: {name}");
         }
@@ -535,11 +586,48 @@ impl Vault {
             rest,
         });
 
-        self.write_items(&items)?;
+        self.write_items_in_format(&items, password)?;
         Ok(id)
     }
 
+    /// Write the item list in whichever format this vault already uses.
+    ///
+    /// A vault does not silently change format: a v1 vault stays v1 until `vault migrate` says
+    /// otherwise, and only a vault that does not exist yet is created as v2. Rewriting someone's
+    /// vault into a format their other tools cannot read, as a side effect of adding an item, is
+    /// not a thing a credential store should do.
+    fn write_items_in_format(&self, items: &[VaultItem], password: &str) -> Result<()> {
+        match self.format()? {
+            Format::V1 => self.write_items(items),
+            Format::V2 | Format::New => self.write_envelope(items, password),
+        }
+    }
+
+    /// Seal the whole list, carrying the sequence forward and hoisting public keys into the header.
+    pub fn write_envelope(&self, items: &[VaultItem], password: &str) -> Result<()> {
+        let sequence = self.envelope()?.map(|e| e.header.sequence + 1).unwrap_or(1);
+
+        // Public keys are published by design; keeping a copy in the header is what lets one be
+        // read — and handed to a provider — without the password. It is covered by the AAD, so it
+        // can be read freely and not altered freely.
+        let mut public = std::collections::BTreeMap::new();
+        for item in items {
+            if let Some(key) = item.rest.get("publicKey") {
+                public.insert(item.name.clone(), key.clone());
+            }
+        }
+
+        let envelope = crate::vault2::seal(password, items, sequence, public)?;
+        let encoded = serde_json::to_string_pretty(&envelope)?;
+        self.write_version(&encoded)
+    }
+
     fn write_items(&self, items: &[VaultItem]) -> Result<()> {
+        let encoded = serde_json::to_string_pretty(items)?;
+        self.write_version(&encoded)
+    }
+
+    fn write_version(&self, encoded: &str) -> Result<()> {
         let versions = self.versions_dir();
         fs::create_dir_all(&versions).with_context(|| format!("creating {}", versions.display()))?;
 
@@ -552,8 +640,6 @@ impl Vault {
         let file_name = format!("{stamp}-{n}-vault.json");
         let version_file = versions.join(&file_name);
 
-        // Pretty-printed, as writerWithDefaultPrettyPrinter produces.
-        let encoded = serde_json::to_string_pretty(items)?;
         fs::write(&version_file, encoded.as_bytes())
             .with_context(|| format!("writing {}", version_file.display()))?;
 

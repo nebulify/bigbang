@@ -42,6 +42,7 @@ pub mod repodb;
 pub mod shell;
 pub mod task;
 pub mod vault;
+pub mod vault2;
 
 /// The operation was attempted and failed.
 pub const EXIT_FAILURE: u8 = 1;

@@ -148,6 +148,15 @@ enum VaultOp {
         #[arg(long)]
         foreground: bool,
     },
+    /// Re-write a v1 vault as one authenticated envelope
+    Migrate {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+        /// Show what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop the agent for a profile
     Lock {
         /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
@@ -311,6 +320,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             VaultOp::Unlock { profile, items, ttl, audit, foreground } => {
                 vault_unlock(&profile, &items, ttl, audit, foreground)
             }
+            VaultOp::Migrate { profile, dry_run } => vault_migrate(&profile, dry_run),
             VaultOp::Lock { profile } => vault_lock(&profile),
             VaultOp::Status { profile } => vault_status(&profile),
             VaultOp::List { profile } => vault_list(&profile),
@@ -362,15 +372,28 @@ fn vault_password() -> Result<String> {
 }
 
 fn vault_list(profile_ref: &str) -> Result<()> {
+    use bigbang::vault::Format;
     let vault = open_vault(profile_ref)?;
-    let items = vault.list()?;
+    // A v1 vault lists without a password because its names are in the clear. A v2 vault asks,
+    // which is not an inconvenience to route around — it is the property being paid for.
+    let items = match vault.format()? {
+        Format::V2 => {
+            let password = vault_password()?;
+            vault.read_items_with(Some(&password))?
+        }
+        _ => vault.read_items()?,
+    };
     if items.is_empty() {
         println!("No vault items found");
         return Ok(());
     }
     println!("Vault items: {}", items.len());
-    for (name, type_) in items {
-        println!("  ✓ {name} ({type_})");
+    for item in &items {
+        let restriction = match item.restriction() {
+            bigbang::vault::Restriction::None => String::new(),
+            other => format!("  [{}]", serde_json::to_value(other).map(|v| v.as_str().unwrap_or("?").to_string()).unwrap_or_default()),
+        };
+        println!("  ✓ {} ({}){restriction}", item.name, item.type_);
     }
     Ok(())
 }
@@ -631,6 +654,67 @@ fn vault_unlock(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     anyhow::bail!("the agent did not come up on {}", socket.display());
+}
+
+/// Re-wrap a v1 vault as v2, verifying every item survives before the pointer moves.
+///
+/// The items themselves are unchanged: each secret keeps its own encrypted payload, so this is a
+/// re-wrap rather than a re-encryption, and every item can be compared byte for byte afterwards.
+/// The old version file stays in .vault-versions, so the migration is reversible by pointing back
+/// at it.
+fn vault_migrate(profile_ref: &str, dry_run: bool) -> Result<()> {
+    use bigbang::vault::Format;
+    let vault = open_vault(profile_ref)?;
+    match vault.format()? {
+        Format::V2 => {
+            println!("Already a {} vault; nothing to do.", bigbang::vault2::FORMAT);
+            return Ok(());
+        }
+        Format::New => anyhow::bail!("there is no vault here yet"),
+        Format::V1 => {}
+    }
+
+    let password = vault_password()?;
+    let before = vault.read_items_with(Some(&password))?;
+    println!("{} item(s) to migrate", before.len());
+    // A wrong password must not be discovered halfway through: v1 leaves the item list readable, so
+    // decrypt one secret first and stop here if it fails.
+    if let Some(first) = before.first() {
+        vault
+            .get(&first.name, &password)
+            .context("the password does not open this vault; nothing was written")?;
+    }
+
+    if dry_run {
+        println!("--dry-run: would write a {} envelope with {} item(s)", bigbang::vault2::FORMAT, before.len());
+        return Ok(());
+    }
+
+    vault.write_envelope(&before, &password)?;
+
+    // Read it back through the same path a normal run uses, and compare.
+    let after = vault.read_items_with(Some(&password))?;
+    if after.len() != before.len() {
+        anyhow::bail!(
+            "migration wrote {} item(s) but {} came back — the previous version is still in \
+             .vault-versions and the pointer can be moved back to it",
+            before.len(), after.len()
+        );
+    }
+    for (a, b) in before.iter().zip(after.iter()) {
+        if a.name != b.name || a.encrypted_content != b.encrypted_content || a.rest != b.rest {
+            anyhow::bail!("item '{}' did not survive the migration intact", a.name);
+        }
+    }
+    // And prove a secret still decrypts, not merely that the bytes match.
+    if let Some(first) = after.first() {
+        vault.get(&first.name, &password).context("a migrated secret failed to decrypt")?;
+    }
+
+    println!("✓ migrated to {} — {} item(s) verified", bigbang::vault2::FORMAT, after.len());
+    println!("  names, descriptions and restrictions are now inside the envelope");
+    println!("  the previous version remains in .vault-versions");
+    Ok(())
 }
 
 fn vault_lock(profile_ref: &str) -> Result<()> {

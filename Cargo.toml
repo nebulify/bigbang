@@ -38,6 +38,8 @@ rustyline = { version = "14", default-features = false, features = ["with-file-h
 # The cached vault password is wiped on drop rather than left in freed memory.
 zeroize = { version = "1", features = ["zeroize_derive"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "alloc", "getrandom"] }
+chacha20poly1305 = "0.11.0"
+argon2 = "0.6.0"
 
 [profile.release]
 lto = true
