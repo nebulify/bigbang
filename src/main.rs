@@ -470,7 +470,7 @@ fn vault_list(profile_ref: &str) -> Result<()> {
 
 fn vault_get(item_id: &str, profile_ref: &str) -> Result<()> {
     let vault = open_vault(profile_ref)?;
-    let password = vault_password()?;
+    let password = vault_password_for(profile_ref)?;
     match vault.get(item_id, &password)? {
         Some(value) => {
             println!("{value}");
@@ -639,7 +639,9 @@ fn vault_unlock(
     let password = vault_password()?;
     let mut items = std::collections::BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();
-    for item in vault.read_items()? {
+    // With the password in hand: a v2 vault cannot be enumerated without it, and unlocking is
+    // precisely the moment it is available.
+    for item in vault.read_items_with(Some(&password))? {
         let name = item.name.clone();
         // An allowlist is the strongest part of this: what is not unlocked cannot be used by
         // mistake, whatever the command says.
@@ -744,7 +746,7 @@ fn vault_migrate(profile_ref: &str, dry_run: bool) -> Result<()> {
         Format::V1 => {}
     }
 
-    let password = vault_password()?;
+    let password = vault_password_for(profile_ref)?;
     let before = vault.read_items_with(Some(&password))?;
     println!("{} item(s) to migrate", before.len());
     // A wrong password must not be discovered halfway through: v1 leaves the item list readable, so
@@ -911,7 +913,7 @@ fn vault_add(
     let password = if vault.format()? == bigbang::vault::Format::New {
         new_vault_password()?
     } else {
-        vault_password()?
+        vault_password_for(profile_ref)?
     };
     // The public half of a keypair is not a secret, and is stored unencrypted beside the item so
     // it can be read back — and handed to a cloud provider — without the vault password at all.

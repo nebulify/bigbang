@@ -60,10 +60,19 @@ else
   TARGET_DIR="$DEFAULT_BIN_DIR"
 fi
 mkdir -p "$TARGET_DIR"
-install -m 0755 "$SRC" "$TARGET_DIR/bigbang"
+# Unlink before copying. Writing over a binary that is currently executing fails with ETXTBSY —
+# a long-lived `bigbang shell` or an unlocked vault agent is enough — whereas removing the
+# directory entry first leaves the running process on its own inode and lets the new file land.
+replace() {
+  src="$1"; dst="$2"
+  rm -f "$dst" 2>/dev/null || true
+  install -m 0755 "$src" "$dst" || die "could not install $dst"
+}
+
+replace "$SRC" "$TARGET_DIR/bigbang"
 ok "$TARGET_DIR/bigbang"
 [ -f "$SRC_BB" ] || die "bb was not built — expected $SRC_BB"
-install -m 0755 "$SRC_BB" "$TARGET_DIR/bb"
+replace "$SRC_BB" "$TARGET_DIR/bb"
 ok "$TARGET_DIR/bb"
 
 # There is one bigbang: the one just built. Any other copy sitting on PATH is a leftover that
@@ -84,8 +93,8 @@ for dir in "${path_dirs[@]}"; do
   [ "$candidate" -ef "$TARGET_DIR/bigbang" ] && continue
   # Only touch it if it actually differs, so a re-run is quiet and honest.
   cmp -s "$SRC" "$candidate" && continue
-  install -m 0755 "$SRC" "$candidate" 2>/dev/null && { ok "replaced older copy at $candidate"; replaced=$((replaced+1)); \
-    [ -e "$resolved_dir/bb" ] && install -m 0755 "$SRC_BB" "$resolved_dir/bb" 2>/dev/null; } \
+  { rm -f "$candidate" 2>/dev/null; install -m 0755 "$SRC" "$candidate" 2>/dev/null; } && { ok "replaced older copy at $candidate"; replaced=$((replaced+1)); \
+    [ -e "$resolved_dir/bb" ] && { rm -f "$resolved_dir/bb" 2>/dev/null; install -m 0755 "$SRC_BB" "$resolved_dir/bb" 2>/dev/null; }; } \
     || warn "could not replace $candidate (permissions?) — remove it manually"
 done
 [ "$replaced" = 0 ] || ok "$replaced other cop$([ "$replaced" = 1 ] && echo y || echo ies) brought up to date"
