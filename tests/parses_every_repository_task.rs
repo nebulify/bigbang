@@ -55,6 +55,64 @@ fn every_task_definition_in_the_repository_parses() {
     eprintln!("parsed {parsed} task definitions, {commands} commands");
 }
 
+/// Which definitions declare something this executor cannot do.
+///
+/// A shrink-only list. Every entry is a task that runs green today while doing less than it says —
+/// `uploadTemplate` declared and never uploading, `vaultAddItem` declared and never writing. The
+/// executor now refuses them outright, so this list records what is owed rather than what is
+/// broken silently. Nothing may be added to it; entries leave as the features land.
+const DECLARES_UNIMPLEMENTED: &[&str] = &[
+    "fetch-kubeconfig.json",
+    "setup-nginx-upstream-metallb.json",
+    "update-nginx-clicky-proxy.json",
+];
+
+#[test]
+fn only_the_known_definitions_declare_unimplemented_features() {
+    let dir = tasks_dir();
+    if !dir.exists() {
+        eprintln!("skipping: {} not present", dir.display());
+        return;
+    }
+
+    let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(def) = TaskDefinition::load_file(&path) else { continue };
+        let unhonoured = bigbang::task::unhonoured_fields(&def);
+        if !unhonoured.is_empty() {
+            offenders.push((
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                unhonoured,
+            ));
+        }
+    }
+
+    let names: Vec<&str> = offenders.iter().map(|(n, _)| n.as_str()).collect();
+    for (name, fields) in &offenders {
+        assert!(
+            DECLARES_UNIMPLEMENTED.contains(&name.as_str()),
+            "{name} declares something the executor cannot honour, and is not on the known list — \
+             implement it or remove it, do not extend the list:\n  {}",
+            fields.join("\n  ")
+        );
+    }
+    // Shrink-only: an entry that no longer offends must come off the list.
+    for known in DECLARES_UNIMPLEMENTED {
+        assert!(
+            names.contains(known),
+            "{known} no longer declares anything unimplemented — remove it from DECLARES_UNIMPLEMENTED"
+        );
+    }
+    eprintln!("{} definition(s) still declare unimplemented features", offenders.len());
+    for (name, fields) in &offenders {
+        eprintln!("  {name}: {}", fields.join(", "));
+    }
+}
+
 /// The assertions written in the repository must reach the model.
 ///
 /// They were declared for a long time and silently dropped: `DetailedCommand` had no such field,

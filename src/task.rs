@@ -37,6 +37,14 @@ pub struct TaskDefinition {
     pub selectors: Vec<String>,
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// The `blaster:task` discriminator. Carried so it does not land in `extra` and read as an
+    /// unhonoured declaration; the library installer is what actually acts on it.
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
+    #[serde(rename = "singleSession", default)]
+    pub single_session: Option<bool>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +64,13 @@ pub struct Task {
     /// Skip the whole task unless this command succeeds.
     #[serde(default)]
     pub condition: Option<String>,
+    /// Anything the model does not implement.
+    ///
+    /// Kept rather than discarded so it can be refused. Silently dropping these is how
+    /// `uploadTemplate` came to be declared by two production nginx tasks that then ran green
+    /// without uploading anything.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// A command is either a bare string or an object. Both forms normalise to the same thing.
@@ -92,6 +107,57 @@ pub struct DetailedCommand {
     /// considered to have succeeded.
     #[serde(default)]
     pub assertions: Vec<Assertion>,
+    /// Anything the model does not implement — see `Task::extra`.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A field is only a demand if it asks for something.
+///
+/// `"functions": []` declares no function, and several definitions carry empty placeholders left
+/// by whatever generated them. Refusing those would be noise; refusing a populated one is the
+/// point.
+pub fn declares_nothing(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Field names that are declared, populated, and that this executor cannot honour.
+///
+/// The whole class of fault this addresses: serde discards what the model does not declare, so an
+/// unimplemented feature is indistinguishable from a working one at the console. `runAs`,
+/// packages, nested variables and assertions each shipped that way. Whatever is left over is now
+/// surfaced instead of dropped, so the next one fails loudly the first time it is run.
+pub fn unhonoured_fields(definition: &TaskDefinition) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut note = |where_: &str, key: &str| out.push(format!("{where_}: '{key}'"));
+
+    for (k, v) in &definition.extra {
+        if !declares_nothing(v) {
+            note("definition", k);
+        }
+    }
+    for task in &definition.tasks {
+        for (k, v) in &task.extra {
+            if !declares_nothing(v) {
+                note(&format!("task '{}'", task.name), k);
+            }
+        }
+        for command in &task.commands {
+            for (k, v) in &command.detail().extra {
+                if !declares_nothing(v) {
+                    note(&format!("task '{}' command", task.name), k);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A check on what a command printed, not on what it returned.
@@ -302,6 +368,9 @@ impl TaskDefinition {
             environment: package.environment.clone(),
             selectors: package.selectors.clone(),
             tasks: Vec::new(),
+            type_: None,
+            single_session: None,
+            extra: BTreeMap::new(),
         };
         for reference in refs {
             let child = Self::load_from_library_guarded(library_root, reference.path(), seen)?

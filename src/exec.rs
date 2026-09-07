@@ -191,6 +191,22 @@ pub fn run_definition(
     variables: &BTreeMap<String, String>,
     executor: &mut dyn CommandExecutor,
 ) -> Result<Vec<TaskOutcome>> {
+    // Refuse before anything runs, not after. A definition asking for something this executor
+    // cannot do is not a definition that "mostly works": update-nginx-clicky-proxy declares
+    // uploadTemplate, and without it the task deploys a config file by not deploying it, then
+    // reports success.
+    let unhonoured = crate::task::unhonoured_fields(definition);
+    if !unhonoured.is_empty() {
+        anyhow::bail!(
+            "'{}' declares {} thing(s) this executor does not implement, so running it would do \
+             less than it says:\n  {}\nImplement them or remove them from the definition — a \
+             partial run that reports success is the failure mode this refuses.",
+            definition.name,
+            unhonoured.len(),
+            unhonoured.join("\n  ")
+        );
+    }
+
     let mut merged = definition.variables.clone();
     for (k, v) in variables {
         merged.insert(k.clone(), v.clone());
@@ -368,6 +384,7 @@ mod tests {
         Task {
             name: "t".into(), description: None, run_as: None,
             commands, continue_on_error: false, verification: vec![], condition: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -393,6 +410,7 @@ mod tests {
             tasks: vec![task(vec![TaskCommand::Simple(
                 "cp ${postgres_config_dir}/postgresql.conf /tmp/b".into(),
             )])],
+            type_: None, single_session: None, extra: BTreeMap::new(),
         };
 
         let mut fake = Fake::new(0);
@@ -416,6 +434,7 @@ mod tests {
             group: None, name: "d".into(), version: None, description: None,
             variables, environment: BTreeMap::new(), selectors: vec![],
             tasks: vec![task(vec![TaskCommand::Simple("ls ${dir}".into())])],
+            type_: None, single_session: None, extra: BTreeMap::new(),
         };
 
         let mut overrides = BTreeMap::new();
@@ -524,6 +543,47 @@ mod tests {
         assert_eq!(detail.assertions.len(), 2, "assertions must survive deserialization");
         assert!(detail.assertions[0].case_sensitive, "caseSensitive defaults to true");
         assert!(!detail.assertions[1].case_sensitive);
+    }
+
+    fn definition_with_extra(extra: serde_json::Value) -> crate::task::TaskDefinition {
+        let mut json = serde_json::json!({
+            "name": "deploy-config",
+            "tasks": [{ "name": "Deploy", "commands": ["true"] }]
+        });
+        // Merge the unknown declaration into the task, as the real definitions carry it.
+        let task = &mut json["tasks"][0];
+        for (k, v) in extra.as_object().unwrap() {
+            task[k] = v.clone();
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A definition asking for something this executor cannot do must refuse before running
+    /// anything, rather than running the part it understands and reporting success.
+    #[test]
+    fn a_definition_declaring_an_unimplemented_feature_refuses_to_run() {
+        let def = definition_with_extra(serde_json::json!({
+            "functions": [{"function": "uploadTemplate", "params": {"remotePath": "/etc/nginx/x"}}]
+        }));
+        let mut fake = Fake::new(0);
+        let err = run_definition(&def, &BTreeMap::new(), &mut fake).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("functions"), "the offending field must be named: {text}");
+        assert!(text.contains("does not implement"), "got: {text}");
+        assert!(fake.seen.is_empty(), "nothing may run before the refusal");
+    }
+
+    /// An empty placeholder asks for nothing, and several generated definitions carry them.
+    #[test]
+    fn empty_placeholder_fields_do_not_block_a_run() {
+        let def = definition_with_extra(serde_json::json!({
+            "functions": [], "onFailure": [], "selectors": [], "steps": []
+        }));
+        let mut fake = Fake::new(0);
+        let outcomes = run_definition(&def, &BTreeMap::new(), &mut fake)
+            .expect("empty declarations must not refuse");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(fake.seen.len(), 1, "the command should still have run");
     }
 
     #[test]

@@ -63,10 +63,23 @@ impl Instance {
         } else {
             (&self.public_ip, &self.private_ip)
         };
-        first
-            .clone()
-            .or_else(|| second.clone())
-            .with_context(|| format!("no IP address for instance {}", self.name))
+        // Blank is absent. A destroyed machine's entry keeps the address cleared, and handing ssh
+        // an empty host produces an error about nothing in particular instead of naming the cause.
+        let usable = |a: &Option<String>| {
+            a.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        usable(first)
+            .or_else(|| usable(second))
+            .with_context(|| {
+                format!(
+                    "no IP address for instance {} — it has none recorded, which is how a \
+                     destroyed machine's entry is kept; provision it and set the address",
+                    self.name
+                )
+            })
     }
 }
 
