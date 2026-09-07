@@ -34,6 +34,23 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// What the agent holds for one item.
+#[derive(Debug, Clone)]
+pub struct UnlockedItem {
+    pub value: String,
+    pub restriction: crate::vault::Restriction,
+    pub prepared: Vec<crate::vault::PreparedCommand>,
+}
+
+/// Invoking a capability rather than composing a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunPrepared {
+    pub item: String,
+    pub command: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     /// The command and its arguments. `{{name}}` in any element is replaced by the agent.
@@ -44,6 +61,9 @@ pub struct AgentRequest {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// When set, `argv` and `env` are ignored: the structure comes from the vault instead.
+    #[serde(default)]
+    pub run_prepared: Option<RunPrepared>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +145,18 @@ pub fn substitute(
     Ok(out)
 }
 
+/// Every `{{name}}` in a string.
+fn placeholders(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let Some(end) = rest[start..].find("}}") else { break };
+        out.push(rest[start + 2..start + end].trim().to_string());
+        rest = &rest[start + end + 2..];
+    }
+    out
+}
+
 /// Remove every injected value from text the caller will see.
 pub fn redact(text: &str, values: &[String]) -> String {
     let mut out = text.to_string();
@@ -137,9 +169,52 @@ pub fn redact(text: &str, values: &[String]) -> String {
     out
 }
 
+fn refuse(message: String) -> AgentResponse {
+    AgentResponse { exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(message) }
+}
+
+/// Only unrestricted items may be substituted into a command the caller composed.
+///
+/// This is where the prepared tier is actually enforced: a `prepared` item is simply not in the map
+/// that `{{name}}` is resolved against, so there is no command anyone can write that reaches it.
+fn substitutable(items: &BTreeMap<String, UnlockedItem>) -> BTreeMap<String, String> {
+    items
+        .iter()
+        .filter(|(_, item)| item.restriction == crate::vault::Restriction::None)
+        .map(|(name, item)| (name.clone(), item.value.clone()))
+        .collect()
+}
+
 /// Run one request: substitute, exec, redact.
-pub fn handle(request: &AgentRequest, items: &BTreeMap<String, String>) -> AgentResponse {
+pub fn handle(request: &AgentRequest, items: &BTreeMap<String, UnlockedItem>) -> AgentResponse {
+    if let Some(invocation) = &request.run_prepared {
+        return run_prepared(invocation, items);
+    }
+    // A restricted item that is asked for by name deserves a better answer than "not unlocked":
+    // it *is* unlocked, and saying so — along with how to reach it — costs nothing, since the name
+    // was supplied by the caller and the value is what stays out of reach.
+    for text in request.argv.iter().chain(request.env.values()) {
+        for name in placeholders(text) {
+            if let Some(item) = items.get(&name) {
+                if item.restriction != crate::vault::Restriction::None {
+                    return refuse(format!(
+                        "'{name}' is restricted and cannot be substituted into a command. Reach it \
+                         with: bb --run {name}/<command>{}",
+                        if item.prepared.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — available: {}",
+                                item.prepared.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(", "))
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
     let mut used: Vec<String> = Vec::new();
+    let plain = substitutable(items);
+    let items = &plain;
 
     let argv: Result<Vec<String>> = request
         .argv
@@ -195,10 +270,105 @@ pub fn handle(request: &AgentRequest, items: &BTreeMap<String, String>) -> Agent
     }
 }
 
+/// Invoke a capability: the vault supplies the structure, the caller supplies parameters.
+fn run_prepared(
+    invocation: &RunPrepared,
+    items: &BTreeMap<String, UnlockedItem>,
+) -> AgentResponse {
+    let Some(item) = items.get(&invocation.item) else {
+        return refuse(format!(
+            "'{}' is not unlocked in this agent. Unlocked: {}",
+            invocation.item,
+            items.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    };
+    let Some(prepared) = item.prepared.iter().find(|c| c.name == invocation.command) else {
+        return refuse(format!(
+            "'{}' has no prepared command '{}'. Available: {}",
+            invocation.item,
+            invocation.command,
+            if item.prepared.is_empty() {
+                "(none)".to_string()
+            } else {
+                item.prepared.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")
+            }
+        ));
+    };
+
+    // Every supplied parameter must be one the command declared. An undeclared parameter is a
+    // caller trying to reach something the template did not offer.
+    for name in invocation.params.keys() {
+        if !prepared.params.contains(name) {
+            return refuse(format!(
+                "'{name}' is not a parameter of '{}'. Declared: {}",
+                prepared.name,
+                if prepared.params.is_empty() { "(none)".into() } else { prepared.params.join(", ") }
+            ));
+        }
+    }
+    for name in &prepared.params {
+        if !invocation.params.contains_key(name) {
+            return refuse(format!("'{}' requires the parameter '{name}'", prepared.name));
+        }
+    }
+
+    // One pass, never rescanned: a parameter value containing "{{self}}" is inert text.
+    let fill = |template: &str| -> String {
+        let mut out = template.replace("{{self}}", &item.value);
+        for (name, value) in &invocation.params {
+            out = out.replace(&format!("{{{{param:{name}}}}}"), value);
+        }
+        out
+    };
+
+    let argv: Vec<String> = prepared.argv.iter().map(|a| fill(a)).collect();
+    if argv.is_empty() {
+        return refuse(format!("prepared command '{}' has no argv", prepared.name));
+    }
+
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    for (key, value) in &prepared.env {
+        command.env(key, fill(value));
+    }
+    let stdin_payload = prepared.stdin.as_ref().map(|s| fill(s));
+    command
+        .stdin(if stdin_payload.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(err) => return refuse(format!("running {}: {err}", argv[0])),
+    };
+    if let Some(payload) = &stdin_payload {
+        if let Some(mut sink) = child.stdin.take() {
+            let _ = sink.write_all(payload.as_bytes());
+        }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(err) => return refuse(format!("waiting for {}: {err}", argv[0])),
+    };
+
+    // The secret is redacted whatever the template does, and a command declaring returnsOutput
+    // false gives back nothing but its exit code — for tools that echo what they were handed.
+    let used = vec![item.value.clone()];
+    let (stdout, stderr) = if prepared.returns_output {
+        (
+            redact(&String::from_utf8_lossy(&out.stdout), &used),
+            redact(&String::from_utf8_lossy(&out.stderr), &used),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    AgentResponse { exit_code: out.status.code().unwrap_or(-1), stdout, stderr, error: None }
+}
+
 /// Listen until the deadline passes or the socket is removed.
 pub fn serve(
     path: &Path,
-    items: BTreeMap<String, String>,
+    items: BTreeMap<String, UnlockedItem>,
     ttl: Duration,
     audit: Option<PathBuf>,
 ) -> Result<()> {
@@ -247,7 +417,7 @@ pub fn serve(
     }
 }
 
-fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, String>, audit: Option<&Path>) {
+fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, audit: Option<&Path>) {
     let Ok(clone) = stream.try_clone() else { return };
     let mut reader = BufReader::new(clone);
     let mut line = String::new();
@@ -316,17 +486,50 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn items() -> BTreeMap<String, String> {
+    use crate::vault::{PreparedCommand, Restriction};
+
+    fn plain(value: &str) -> UnlockedItem {
+        UnlockedItem { value: value.into(), restriction: Restriction::None, prepared: vec![] }
+    }
+
+    fn items() -> BTreeMap<String, UnlockedItem> {
         let mut m = BTreeMap::new();
-        m.insert("db_password".to_string(), "s3cr3t-value-long".to_string());
-        m.insert("token".to_string(), "tok-abcdefghij".to_string());
+        m.insert("db_password".to_string(), plain("s3cr3t-value-long"));
+        m.insert("token".to_string(), plain("tok-abcdefghij"));
         m
+    }
+
+    /// An item that may only be reached through a named capability.
+    fn restricted() -> BTreeMap<String, UnlockedItem> {
+        let mut m = items();
+        m.insert(
+            "registry_token".to_string(),
+            UnlockedItem {
+                value: "hunter2-registry-token".into(),
+                restriction: Restriction::Prepared,
+                prepared: vec![PreparedCommand {
+                    name: "show-length".into(),
+                    description: None,
+                    // Reads the secret from stdin, so it never touches argv or the environment.
+                    argv: vec!["sh".into(), "-c".into(), "wc -c".into()],
+                    stdin: Some("{{self}}".into()),
+                    env: BTreeMap::new(),
+                    params: vec![],
+                    returns_output: true,
+                }],
+            },
+        );
+        m
+    }
+
+    fn values() -> BTreeMap<String, String> {
+        items().into_iter().map(|(k, v)| (k, v.value)).collect()
     }
 
     #[test]
     fn placeholders_are_replaced_and_recorded() {
         let mut used = Vec::new();
-        let out = substitute("psql://{{db_password}}@host", &items(), &mut used).unwrap();
+        let out = substitute("psql://{{db_password}}@host", &values(), &mut used).unwrap();
         assert_eq!(out, "psql://s3cr3t-value-long@host");
         assert_eq!(used, vec!["s3cr3t-value-long".to_string()]);
     }
@@ -335,7 +538,7 @@ mod tests {
     #[test]
     fn an_unknown_placeholder_is_an_error_not_a_passthrough() {
         let mut used = Vec::new();
-        let err = substitute("{{nope}}", &items(), &mut used).unwrap_err();
+        let err = substitute("{{nope}}", &values(), &mut used).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("not unlocked"), "{text}");
         assert!(text.contains("db_password"), "it should say what is available: {text}");
@@ -346,11 +549,11 @@ mod tests {
         // Deliberately under six characters so redaction leaves it visible; the property under
         // test is that no shell parsed it, not that it was hidden.
         let mut m = BTreeMap::new();
-        m.insert("v".to_string(), "a;b`c".to_string());
+        m.insert("v".to_string(), plain("a;b`c"));
 
         // Arrives whole: a shell would have split on ';' and run `c` as a command substitution.
         let response = handle(
-            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None },
+            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None },
             &m,
         );
         assert_eq!(response.exit_code, 0);
@@ -361,7 +564,7 @@ mod tests {
             &AgentRequest {
                 argv: vec!["sh".into(), "-c".into(), "echo $#".into(), "_".into(), "{{v}}".into()],
                 env: BTreeMap::new(),
-                cwd: None,
+                cwd: None, run_prepared: None,
             },
             &m,
         );
@@ -372,9 +575,9 @@ mod tests {
     #[test]
     fn a_long_value_is_redacted_even_when_it_contains_metacharacters() {
         let mut m = BTreeMap::new();
-        m.insert("v".to_string(), "a; rm -rf / --long-enough".to_string());
+        m.insert("v".to_string(), plain("a; rm -rf / --long-enough"));
         let response = handle(
-            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None },
+            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None },
             &m,
         );
         assert!(!response.stdout.contains("rm -rf"), "leaked: {}", response.stdout);
@@ -386,7 +589,7 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "echo {{db_password}}".into()],
             env: BTreeMap::new(),
-            cwd: None,
+            cwd: None, run_prepared: None,
         };
         let response = handle(&request, &items());
         assert!(!response.stdout.contains("s3cr3t-value-long"), "leaked: {}", response.stdout);
@@ -400,7 +603,7 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "test -n \"$SECRET\" && echo present".into()],
             env,
-            cwd: None,
+            cwd: None, run_prepared: None,
         };
         let response = handle(&request, &items());
         assert_eq!(response.exit_code, 0);
@@ -414,7 +617,7 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "exit 7".into()],
             env: BTreeMap::new(),
-            cwd: None,
+            cwd: None, run_prepared: None,
         };
         assert_eq!(handle(&request, &items()).exit_code, 7);
     }
@@ -424,11 +627,130 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["definitely-not-a-real-binary-xyz".into()],
             env: BTreeMap::new(),
-            cwd: None,
+            cwd: None, run_prepared: None,
         };
         let response = handle(&request, &items());
         assert_ne!(response.exit_code, 0);
         assert!(response.error.is_some());
+    }
+
+    /// The property the prepared tier exists for: there is no command anyone can compose that
+    /// reaches the value, because it is not in the map placeholders resolve against.
+    #[test]
+    fn a_prepared_item_cannot_be_substituted_into_a_composed_command() {
+        let response = handle(
+            &AgentRequest {
+                argv: vec!["echo".into(), "{{registry_token}}".into()],
+                env: BTreeMap::new(), cwd: None, run_prepared: None,
+            },
+            &restricted(),
+        );
+        let error = response.error.expect("a restricted item must not substitute");
+        assert!(error.contains("restricted"), "{error}");
+        // It should say how to reach it properly rather than merely refusing.
+        assert!(error.contains("--run"), "{error}");
+        assert!(error.contains("show-length"), "{error}");
+
+        // The same via the environment, which is the other injection path.
+        let mut env = BTreeMap::new();
+        env.insert("T".to_string(), "{{registry_token}}".to_string());
+        let response = handle(
+            &AgentRequest { argv: vec!["true".into()], env, cwd: None, run_prepared: None },
+            &restricted(),
+        );
+        assert!(response.error.is_some(), "env injection must be refused too");
+    }
+
+    #[test]
+    fn a_prepared_command_can_use_the_value_it_guards() {
+        let response = handle(
+            &AgentRequest {
+                argv: vec![], env: BTreeMap::new(), cwd: None,
+                run_prepared: Some(RunPrepared {
+                    item: "registry_token".into(),
+                    command: "show-length".into(),
+                    params: BTreeMap::new(),
+                }),
+            },
+            &restricted(),
+        );
+        assert_eq!(response.exit_code, 0, "{:?}", response.error);
+        // wc -c over the secret: it reached the child, and only its length came back.
+        assert_eq!(response.stdout.trim(), "22");
+        assert!(!response.stdout.contains("hunter2"), "leaked: {}", response.stdout);
+    }
+
+    #[test]
+    fn an_undeclared_parameter_is_refused() {
+        let mut params = BTreeMap::new();
+        params.insert("sneaky".to_string(), "value".to_string());
+        let response = handle(
+            &AgentRequest {
+                argv: vec![], env: BTreeMap::new(), cwd: None,
+                run_prepared: Some(RunPrepared {
+                    item: "registry_token".into(),
+                    command: "show-length".into(),
+                    params,
+                }),
+            },
+            &restricted(),
+        );
+        let error = response.error.expect("undeclared parameters must be refused");
+        assert!(error.contains("sneaky"), "{error}");
+    }
+
+    /// A parameter is data. Substitution happens once and the result is never rescanned, so a
+    /// parameter containing a placeholder cannot reach another secret — the injection this design
+    /// borrows from prepared statements specifically to prevent.
+    #[test]
+    fn a_parameter_cannot_smuggle_in_another_placeholder() {
+        let mut m = restricted();
+        m.insert(
+            "echoer".to_string(),
+            UnlockedItem {
+                value: "not-used".into(),
+                restriction: Restriction::Prepared,
+                prepared: vec![PreparedCommand {
+                    name: "say".into(),
+                    description: None,
+                    argv: vec!["echo".into(), "{{param:text}}".into()],
+                    stdin: None,
+                    env: BTreeMap::new(),
+                    params: vec!["text".into()],
+                    returns_output: true,
+                }],
+            },
+        );
+        let mut params = BTreeMap::new();
+        params.insert("text".to_string(), "{{db_password}} {{self}}".to_string());
+        let response = handle(
+            &AgentRequest {
+                argv: vec![], env: BTreeMap::new(), cwd: None,
+                run_prepared: Some(RunPrepared {
+                    item: "echoer".into(), command: "say".into(), params,
+                }),
+            },
+            &m,
+        );
+        assert_eq!(response.exit_code, 0, "{:?}", response.error);
+        assert!(!response.stdout.contains("s3cr3t-value-long"), "reached another secret: {}", response.stdout);
+        assert!(!response.stdout.contains("not-used"), "reached its own secret: {}", response.stdout);
+        assert!(response.stdout.contains("{{db_password}}"), "should stay literal: {}", response.stdout);
+    }
+
+    #[test]
+    fn an_unknown_prepared_command_lists_what_exists() {
+        let response = handle(
+            &AgentRequest {
+                argv: vec![], env: BTreeMap::new(), cwd: None,
+                run_prepared: Some(RunPrepared {
+                    item: "registry_token".into(), command: "nope".into(), params: BTreeMap::new(),
+                }),
+            },
+            &restricted(),
+        );
+        let error = response.error.unwrap();
+        assert!(error.contains("show-length"), "{error}");
     }
 
     #[test]
@@ -456,7 +778,7 @@ mod tests {
             &AgentRequest {
                 argv: vec!["sh".into(), "-c".into(), "echo {{token}}".into()],
                 env: BTreeMap::new(),
-                cwd: None,
+                cwd: None, run_prepared: None,
             },
         )
         .unwrap();

@@ -40,6 +40,10 @@ fn usage() -> ! {
     eprintln!("  {{{{item-name}}}} in any argument or --env value is replaced by the agent.");
     eprintln!("  Prefer --env: a value in an argument is visible in `ps`.");
     eprintln!();
+    eprintln!("  bb --profile <name> --run <item>/<command> [--param NAME=VALUE]...");
+    eprintln!("      invoke a prepared command. Restricted items can only be reached this way:");
+    eprintln!("      the vault supplies the structure, you supply parameters.");
+    eprintln!();
     eprintln!("  Unlock first:  bigbang vault unlock --profile <name>");
     std::process::exit(2)
 }
@@ -52,6 +56,8 @@ fn run() -> Result<u8> {
 
     let mut profile_ref: Option<String> = None;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let mut run: Option<(String, String)> = None;
+    let mut params: BTreeMap<String, String> = BTreeMap::new();
     let mut index = 0usize;
 
     while index < args.len() {
@@ -62,6 +68,23 @@ fn run() -> Result<u8> {
             }
             "--profile" => {
                 profile_ref = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--run" => {
+                // item/command — a capability is named, not composed.
+                let spec = args.get(index + 1).context("--run needs <item>/<command>")?;
+                let (item, command) = spec
+                    .split_once('/')
+                    .with_context(|| format!("--run expects <item>/<command>, got '{spec}'"))?;
+                run = Some((item.to_string(), command.to_string()));
+                index += 2;
+            }
+            "--param" => {
+                let pair = args.get(index + 1).context("--param needs NAME=VALUE")?;
+                let (name, value) = pair
+                    .split_once('=')
+                    .with_context(|| format!("--param expects NAME=VALUE, got '{pair}'"))?;
+                params.insert(name.to_string(), value.to_string());
                 index += 2;
             }
             "--env" => {
@@ -80,7 +103,7 @@ fn run() -> Result<u8> {
     }
 
     let argv: Vec<String> = args[index..].to_vec();
-    if argv.is_empty() {
+    if argv.is_empty() && run.is_none() {
         usage();
     }
 
@@ -104,6 +127,7 @@ fn run() -> Result<u8> {
             argv,
             env,
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+            run_prepared: run.map(|(item, command)| agent::RunPrepared { item, command, params }),
         },
     )?;
 

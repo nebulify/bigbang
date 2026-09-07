@@ -195,6 +195,13 @@ enum VaultOp {
         /// Comment to embed in a generated SSH key. Defaults to the item id.
         #[arg(long, requires = "generate")]
         comment: Option<String>,
+        /// none (default), prepared (usable only through its prepared commands), or always
+        /// (never held by the agent).
+        #[arg(long, default_value = "none")]
+        restriction: String,
+        /// A JSON array of prepared commands, required by --restriction prepared.
+        #[arg(long = "prepared-file")]
+        prepared_file: Option<PathBuf>,
         #[arg(long = "type", default_value = "PASSWORD")]
         type_: String,
         #[arg(long)]
@@ -310,11 +317,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
             VaultOp::Add {
                 item_id, data, data_file, stdin, generate, length, min_length, max_length,
-                special, charset, comment, type_, description, profile,
+                special, charset, comment, restriction, prepared_file, type_, description, profile,
             } => vault_add(
                 &item_id, data.as_deref(), data_file.as_deref(), stdin,
                 GenerateOptions { generate, length, min_length, max_length, special,
                                   charset: charset.clone(), comment: comment.clone() },
+                &restriction, prepared_file.as_deref(),
                 &type_, description.as_deref(), &profile,
             ),
         },
@@ -537,14 +545,29 @@ fn vault_unlock(
     let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
     let mut items = std::collections::BTreeMap::new();
-    for (name, _type) in vault.list()? {
+    let mut withheld: Vec<String> = Vec::new();
+    for item in vault.read_items()? {
+        let name = item.name.clone();
         // An allowlist is the strongest part of this: what is not unlocked cannot be used by
         // mistake, whatever the command says.
         if !wanted.is_empty() && !wanted.iter().any(|w| w == &name) {
             continue;
         }
+        let restriction = item.restriction();
+        if restriction == bigbang::vault::Restriction::Always {
+            // The whole point of the tier: this one is never delegated.
+            withheld.push(name);
+            continue;
+        }
         if let Some(value) = vault.get(&name, &password)? {
-            items.insert(name, value);
+            items.insert(
+                name,
+                bigbang::agent::UnlockedItem {
+                    value,
+                    restriction,
+                    prepared: item.prepared_commands(),
+                },
+            );
         }
     }
     if items.is_empty() {
@@ -557,8 +580,21 @@ fn vault_unlock(
     }
 
     println!("🔓 {} unlocked: {} item(s), {} minutes", profile.name, items.len(), ttl_secs / 60);
-    for name in items.keys() {
-        println!("   {name}");
+    for (name, item) in &items {
+        match item.restriction {
+            bigbang::vault::Restriction::Prepared => println!(
+                "   {name}  [prepared only: {}]",
+                if item.prepared.is_empty() {
+                    "no commands defined, so unusable".to_string()
+                } else {
+                    item.prepared.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")
+                }
+            ),
+            _ => println!("   {name}"),
+        }
+    }
+    for name in &withheld {
+        println!("   {name}  [always: not delegated, asks for the password each time]");
     }
     println!("   socket {}", socket.display());
     println!("   use it with: bb -- <command with {{{{item-name}}}}>");
@@ -644,10 +680,33 @@ fn vault_add(
     data_file: Option<&std::path::Path>,
     stdin: bool,
     gen: GenerateOptions,
+    restriction: &str,
+    prepared_file: Option<&std::path::Path>,
     type_: &str,
     description: Option<&str>,
     profile_ref: &str,
 ) -> Result<()> {
+    let restriction = bigbang::vault::Restriction::parse(restriction)?;
+    let prepared: Vec<bigbang::vault::PreparedCommand> = match prepared_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parsing prepared commands from {}", path.display()))?
+        }
+        None => Vec::new(),
+    };
+    // A prepared item with no commands is unreachable: nothing may substitute it and there is
+    // nothing to invoke. Storing it would look like protection and be a dead credential.
+    if restriction == bigbang::vault::Restriction::Prepared && prepared.is_empty() {
+        anyhow::bail!(
+            "--restriction prepared needs --prepared-file: without a command the item cannot be \
+             used at all, which is a dead credential rather than a protected one"
+        );
+    }
+    if !prepared.is_empty() && restriction != bigbang::vault::Restriction::Prepared {
+        anyhow::bail!("--prepared-file only means something with --restriction prepared");
+    }
     let mut public_key: Option<String> = None;
 
     let value = match (data, data_file, stdin, gen.generate) {
@@ -698,17 +757,34 @@ fn vault_add(
     let password = vault_password()?;
     // The public half of a keypair is not a secret, and is stored unencrypted beside the item so
     // it can be read back — and handed to a cloud provider — without the vault password at all.
-    let metadata = public_key.as_ref().map(|pk| {
-        let mut m = serde_json::Map::new();
-        m.insert("publicKey".to_string(), serde_json::Value::String(pk.clone()));
-        m
-    });
+    let mut meta = serde_json::Map::new();
+    if let Some(pk) = &public_key {
+        meta.insert("publicKey".to_string(), serde_json::Value::String(pk.clone()));
+    }
+    if restriction != bigbang::vault::Restriction::None {
+        meta.insert("restriction".to_string(), serde_json::to_value(restriction)?);
+    }
+    if !prepared.is_empty() {
+        meta.insert("preparedCommands".to_string(), serde_json::to_value(&prepared)?);
+    }
+    let metadata = if meta.is_empty() { None } else { Some(meta) };
     vault.add_with_metadata(item_id, type_, description, &value, &password, metadata)?;
 
     // Deliberately reports the length rather than any part of the value.
     println!("✓ Added vault item: {item_id} ({} bytes, {type_})", value.len());
     if gen.generate {
         println!("  generated and stored; it has not been displayed and is not recoverable from this output");
+    }
+    match restriction {
+        bigbang::vault::Restriction::Prepared => println!(
+            "  restricted: usable only through {} prepared command(s): {}",
+            prepared.len(),
+            prepared.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")
+        ),
+        bigbang::vault::Restriction::Always => {
+            println!("  restricted: never held by the agent; every use asks for the password")
+        }
+        bigbang::vault::Restriction::None => {}
     }
     if let Some(pk) = public_key {
         println!();

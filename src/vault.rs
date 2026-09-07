@@ -22,6 +22,7 @@
 //! <vault>/<account>/<project>/.vault-versions/<ts>-<n>-vault.json   pretty-printed array of items
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -563,5 +564,86 @@ impl Vault {
         fs::write(&tmp, file_name.as_bytes())?;
         fs::rename(&tmp, &pointer).with_context(|| format!("swapping {}", pointer.display()))?;
         Ok(())
+    }
+}
+
+// ── restriction tiers ──────────────────────────────────────────────────────────
+
+/// How much an unlocked item may be used for.
+///
+/// The tiers exist because credentials are not equally dangerous. An int database password whose
+/// blast radius is a throwaway VPS does not need the ceremony that a credential with no test
+/// equivalent does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Restriction {
+    /// The credential as data: readable, fetchable, substitutable into any command.
+    #[default]
+    None,
+    /// The credential as a capability. Never substituted into a command the caller composed, never
+    /// printed by `vault get`; usable only through the prepared commands stored beside it.
+    Prepared,
+    /// No delegation. The agent will not hold it, so every use costs a password prompt.
+    Always,
+}
+
+impl Restriction {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Ok(Restriction::None),
+            "prepared" => Ok(Restriction::Prepared),
+            "always" => Ok(Restriction::Always),
+            other => bail!("unknown restriction '{other}' — expected none, prepared or always"),
+        }
+    }
+}
+
+/// A command whose *structure* comes from the vault and whose values come from the caller.
+///
+/// The prepared-statement property: the caller supplies parameters, never syntax. `{{self}}` is the
+/// item's own secret and `{{param:name}}` a declared parameter; nothing else is substituted, and
+/// the result is never rescanned, so a parameter cannot introduce a placeholder of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// argv, as discrete elements. There is no shell, so a parameter cannot become syntax.
+    pub argv: Vec<String>,
+    /// Written to the child's stdin. `{{self}}` here is how a secret reaches a tool without
+    /// touching argv or the environment — `docker login --password-stdin` is the shape.
+    #[serde(default)]
+    pub stdin: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMapString,
+    /// Parameters the caller may supply. Anything else is refused.
+    #[serde(default)]
+    pub params: Vec<String>,
+    /// Whether the child's output comes back at all. Some tools echo what they were given.
+    #[serde(rename = "returnsOutput", default = "default_true")]
+    pub returns_output: bool,
+}
+
+type BTreeMapString = std::collections::BTreeMap<String, String>;
+
+fn default_true() -> bool {
+    true
+}
+
+impl VaultItem {
+    pub fn restriction(&self) -> Restriction {
+        self.rest
+            .get("restriction")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Restriction::parse(s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn prepared_commands(&self) -> Vec<PreparedCommand> {
+        self.rest
+            .get("preparedCommands")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
     }
 }
