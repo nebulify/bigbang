@@ -144,6 +144,12 @@ enum VaultOp {
         /// Read the value from standard input.
         #[arg(long, conflicts_with_all = ["data", "data_file"])]
         stdin: bool,
+        /// Generate a random value and store it without ever displaying it.
+        #[arg(long, conflicts_with_all = ["data", "data_file", "stdin"])]
+        generate: bool,
+        /// Characters to generate. 32 alphanumerics is roughly 190 bits.
+        #[arg(long, default_value_t = 32, requires = "generate")]
+        length: usize,
         #[arg(long = "type", default_value = "PASSWORD")]
         type_: String,
         #[arg(long)]
@@ -252,8 +258,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Vault { operation } => match operation {
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
-            VaultOp::Add { item_id, data, data_file, stdin, type_, description, profile } => {
-                vault_add(&item_id, data.as_deref(), data_file.as_deref(), stdin, &type_, description.as_deref(), &profile)
+            VaultOp::Add { item_id, data, data_file, stdin, generate, length, type_, description, profile } => {
+                vault_add(&item_id, data.as_deref(), data_file.as_deref(), stdin, generate, length,
+                          &type_, description.as_deref(), &profile)
             }
         },
     }
@@ -463,21 +470,31 @@ fn vault_add(
     data: Option<&str>,
     data_file: Option<&std::path::Path>,
     stdin: bool,
+    generate: bool,
+    length: usize,
     type_: &str,
     description: Option<&str>,
     profile_ref: &str,
 ) -> Result<()> {
-    let value = match (data, data_file, stdin) {
-        (Some(d), _, _) => d.to_string(),
-        (_, Some(path), _) => std::fs::read_to_string(path)
+    let value = match (data, data_file, stdin, generate) {
+        (Some(d), _, _, _) => d.to_string(),
+        (_, Some(path), _, _) => std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?,
-        (_, _, true) => {
+        (_, _, true, _) => {
             use std::io::Read;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf).context("reading the value from stdin")?;
             buf
         }
-        _ => anyhow::bail!("supply the value with --data, --data-file <path>, or --stdin"),
+        (_, _, _, true) => {
+            if length < 16 {
+                anyhow::bail!("--length {length} is too short to generate; 16 is the floor, 32 the default");
+            }
+            bigbang::vault::generate_secret(length)
+        }
+        _ => anyhow::bail!(
+            "supply the value with --data, --data-file <path>, --stdin, or --generate"
+        ),
     };
     if value.trim().is_empty() {
         anyhow::bail!("refusing to store an empty value as '{item_id}'");
@@ -488,6 +505,10 @@ fn vault_add(
     vault.add(item_id, type_, description, &value, &password)?;
     // Deliberately reports the length rather than any part of the value.
     println!("✓ Added vault item: {item_id} ({} bytes, {type_})", value.len());
+    if generate {
+        println!("  generated and stored; it has not been displayed and is not recoverable from this output");
+        println!("  read it back with: bigbang vault get --item-id {item_id} --profile <profile>");
+    }
     Ok(())
 }
 

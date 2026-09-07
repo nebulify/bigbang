@@ -34,6 +34,45 @@ use serde::{Deserialize, Serialize};
 
 const ITERATIONS: u32 = 120_000;
 const KEY_LENGTH: usize = 32; // 256 bits
+
+/// The alphabet generated secrets are drawn from.
+///
+/// Deliberately alphanumeric. A generated password ends up in a JDBC URL, a connection string, a
+/// YAML value and a shell command, and `@`, `:`, `/` and `#` each break at least one of those —
+/// usually far from where the password was chosen. Entropy comes from length instead, which is
+/// free: 32 of these characters is about 190 bits, well beyond anything the length of a symbol
+/// alphabet would buy.
+const SECRET_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// A random secret, drawn from the OS CSPRNG.
+///
+/// The point of generating rather than supplying is that the value never exists anywhere else: not
+/// in a scratchpad file, not in a shell history, not in a terminal transcript. It goes from the
+/// system's entropy source into the vault and stops there.
+pub fn generate_secret(length: usize) -> String {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+
+    let mut out = String::with_capacity(length);
+    let mut buf = [0u8; 64];
+    let n = SECRET_ALPHABET.len() as u8;
+    // Rejection sampling: taking a raw byte modulo 62 would make the first few characters of the
+    // alphabet slightly likelier than the rest. The bias is small and there is no reason to accept
+    // it, so bytes landing in the incomplete final block are discarded.
+    let limit = 256u16 - (256u16 % n as u16);
+    while out.len() < length {
+        OsRng.fill_bytes(&mut buf);
+        for byte in buf.iter() {
+            if (*byte as u16) < limit {
+                out.push(SECRET_ALPHABET[(*byte % n) as usize] as char);
+                if out.len() == length {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
 const IV_LENGTH: usize = 12;
 const SALT_LENGTH: usize = 16;
 
@@ -176,6 +215,61 @@ mod tests {
     fn round_trip() {
         let payload = encrypt("pw", "hello").unwrap();
         assert_eq!(decrypt("pw", &payload).unwrap(), "hello");
+    }
+
+    #[test]
+    fn a_generated_secret_has_the_requested_length_and_a_safe_alphabet() {
+        for len in [16usize, 32, 64, 100] {
+            let s = generate_secret(len);
+            assert_eq!(s.chars().count(), len, "length {len}");
+            assert!(
+                s.chars().all(|c| c.is_ascii_alphanumeric()),
+                "a generated secret ends up in JDBC URLs, YAML and shell commands: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_secrets_do_not_repeat() {
+        let a = generate_secret(32);
+        let b = generate_secret(32);
+        assert_ne!(a, b);
+        // A stuck source would produce one character repeated; catch that rather than trust it.
+        assert!(a.chars().collect::<std::collections::BTreeSet<_>>().len() > 8, "{a}");
+    }
+
+    /// The rejection sampling exists to stop the first characters of the alphabet being likelier
+    /// than the rest. 62 does not divide 256, so `byte % 62` would favour 'A'..'H' by about 8%.
+    #[test]
+    fn the_alphabet_is_drawn_uniformly() {
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<char, usize> = BTreeMap::new();
+        let sample = generate_secret(62 * 2000);
+        for c in sample.chars() {
+            *counts.entry(c).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 62, "every character should appear at this sample size");
+        let expected = (62 * 2000) as f64 / 62.0;
+        let (min, max) = (
+            *counts.values().min().unwrap() as f64,
+            *counts.values().max().unwrap() as f64,
+        );
+        // The bounds come from the arithmetic, not from taste. 256 % 62 == 8, so without
+        // rejection the bytes 248..=255 fold onto the first eight characters and make them 5/4 —
+        // 21% — likelier than the rest. At this sample size one standard deviation is about 2.2%,
+        // so a ±12% window is roughly 5 sigma of noise (a flake is vanishingly unlikely) while
+        // still sitting well inside the 21% a biased implementation would produce.
+        //
+        // An earlier version of this test used ±30% and passed happily against exactly that bug.
+        assert!(min > expected * 0.88, "under-represented character: {min} vs {expected}");
+        assert!(max < expected * 1.12, "over-represented character: {max} vs {expected}");
+    }
+
+    #[test]
+    fn a_generated_secret_survives_the_round_trip_it_will_actually_take() {
+        let secret = generate_secret(32);
+        let payload = encrypt("pw", &secret).unwrap();
+        assert_eq!(decrypt("pw", &payload).unwrap(), secret);
     }
 
     #[test]
