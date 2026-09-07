@@ -191,6 +191,19 @@ pub fn run_definition(
     variables: &BTreeMap<String, String>,
     executor: &mut dyn CommandExecutor,
 ) -> Result<Vec<TaskOutcome>> {
+    run_definition_with(definition, variables, executor, None)
+}
+
+/// As `run_definition`, with the context the non-shell functions need.
+///
+/// A run with no context can still execute commands; it simply cannot upload a file or write to
+/// the vault, and says so rather than skipping quietly.
+pub fn run_definition_with(
+    definition: &TaskDefinition,
+    variables: &BTreeMap<String, String>,
+    executor: &mut dyn CommandExecutor,
+    ctx: Option<&crate::functions::FunctionContext>,
+) -> Result<Vec<TaskOutcome>> {
     // Refuse before anything runs, not after. A definition asking for something this executor
     // cannot do is not a definition that "mostly works": update-nginx-clicky-proxy declares
     // uploadTemplate, and without it the task deploys a config file by not deploying it, then
@@ -216,9 +229,13 @@ pub fn run_definition(
     // `${postgres_major_version}` reached the shell verbatim.
     let merged = crate::task::resolve_nested(merged);
 
+    // Variables change during a run now: captureOutput writes one, and a function can produce
+    // one. A later task reads what an earlier one captured, which is the whole point of
+    // fetch-kubeconfig capturing a file and handing it to the vault.
+    let mut merged = merged;
     let mut outcomes = Vec::new();
     for task in &definition.tasks {
-        let outcome = run_task(task, &merged, executor)?;
+        let outcome = run_task_with(task, &mut merged, executor, ctx)?;
         let failed = outcome.failed.is_some();
         outcomes.push(outcome);
         if failed && !task.continue_on_error {
@@ -233,6 +250,16 @@ fn run_task(
     variables: &BTreeMap<String, String>,
     executor: &mut dyn CommandExecutor,
 ) -> Result<TaskOutcome> {
+    let mut owned = variables.clone();
+    run_task_with(task, &mut owned, executor, None)
+}
+
+fn run_task_with(
+    task: &Task,
+    variables: &mut BTreeMap<String, String>,
+    executor: &mut dyn CommandExecutor,
+    ctx: Option<&crate::functions::FunctionContext>,
+) -> Result<TaskOutcome> {
     let mut outcome = TaskOutcome { task_name: task.name.clone(), ..Default::default() };
 
     // A task-level condition gates everything below it.
@@ -242,6 +269,25 @@ fn run_task(
             outcome.skipped.push(format!("task '{}' (condition not met)", task.name));
             return Ok(outcome);
         }
+    }
+
+    // Before the commands: the definitions assume the file is already there. The Clicky task's
+    // only command is `test -f <path>`, which checks that this upload happened.
+    for function in &task.functions {
+        let Some(ctx) = ctx else {
+            outcome.failed = Some(format!(
+                "task '{}' declares the function '{}', and this run has no context to perform it",
+                task.name, function.label()
+            ));
+            return Ok(outcome);
+        };
+        if let Err(err) = crate::functions::run_function(
+            function, variables, task.run_as.as_deref(), ctx, executor,
+        ) {
+            outcome.failed = Some(format!("function '{}': {err:#}", function.label()));
+            return Ok(outcome);
+        }
+        outcome.ran.push(format!("[fn] {}", function.label()));
     }
 
     for command in &task.commands {
@@ -259,6 +305,9 @@ fn run_task(
             // The exit code is often not the truth: psql exits 0 having printed
             // "ERROR: ... already exists". Assertions are checked on the success path precisely
             // because that is the case they exist to catch.
+            if let Some(name) = detail.output_variable.as_ref().filter(|_| detail.capture_output.unwrap_or(false)) {
+                variables.insert(name.clone(), result.output.trim().to_string());
+            }
             if let Some(reason) = failed_assertion(&detail, &result.output) {
                 let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
                 if tolerated {
@@ -384,7 +433,7 @@ mod tests {
         Task {
             name: "t".into(), description: None, run_as: None,
             commands, continue_on_error: false, verification: vec![], condition: None,
-            extra: BTreeMap::new(),
+            functions: vec![], extra: BTreeMap::new(),
         }
     }
 
@@ -562,13 +611,14 @@ mod tests {
     /// anything, rather than running the part it understands and reporting success.
     #[test]
     fn a_definition_declaring_an_unimplemented_feature_refuses_to_run() {
+        // `onFailure` is still not implemented — `functions` is, so it no longer belongs here.
         let def = definition_with_extra(serde_json::json!({
-            "functions": [{"function": "uploadTemplate", "params": {"remotePath": "/etc/nginx/x"}}]
+            "onFailure": [{"do": "something this executor knows nothing about"}]
         }));
         let mut fake = Fake::new(0);
         let err = run_definition(&def, &BTreeMap::new(), &mut fake).unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("functions"), "the offending field must be named: {text}");
+        assert!(text.contains("onFailure"), "the offending field must be named: {text}");
         assert!(text.contains("does not implement"), "got: {text}");
         assert!(fake.seen.is_empty(), "nothing may run before the refusal");
     }

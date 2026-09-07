@@ -205,7 +205,9 @@ impl Vault {
     /// what the Kotlin implementation does — versions are per-vault, not per-item. Reading the
     /// existing items first therefore matters: writing only the new one would silently drop every
     /// other secret in the project.
-    pub fn add(&self, name: &str, type_: &str, description: Option<&str>, plain_text: &str, password: &str) -> Result<()> {
+    /// Returns the new item's id, so a caller storing it in a variable records the identity the
+    /// vault actually assigned rather than echoing back the name it was given.
+    pub fn add(&self, name: &str, type_: &str, description: Option<&str>, plain_text: &str, password: &str) -> Result<String> {
         let mut items = self.read_items()?;
         if items.iter().any(|i| i.name == name) {
             bail!("Vault item already exists: {name}");
@@ -217,8 +219,9 @@ impl Vault {
         rest.insert("createdAt".into(), serde_json::Value::String(now.clone()));
         rest.insert("updatedAt".into(), serde_json::Value::String(now));
 
+        let id = uuid::Uuid::new_v4().to_string();
         items.push(VaultItem {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: id.clone(),
             name: name.to_string(),
             type_: type_.to_string(),
             description: description.map(str::to_string),
@@ -229,7 +232,8 @@ impl Vault {
             rest,
         });
 
-        self.write_items(&items)
+        self.write_items(&items)?;
+        Ok(id)
     }
 
     fn write_items(&self, items: &[VaultItem]) -> Result<()> {

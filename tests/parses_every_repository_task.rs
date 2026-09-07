@@ -61,11 +61,9 @@ fn every_task_definition_in_the_repository_parses() {
 /// `uploadTemplate` declared and never uploading, `vaultAddItem` declared and never writing. The
 /// executor now refuses them outright, so this list records what is owed rather than what is
 /// broken silently. Nothing may be added to it; entries leave as the features land.
-const DECLARES_UNIMPLEMENTED: &[&str] = &[
-    "fetch-kubeconfig.json",
-    "setup-nginx-upstream-metallb.json",
-    "update-nginx-clicky-proxy.json",
-];
+/// Empty, and it should stay that way. uploadTemplate, vaultAddItem, captureOutput and
+/// outputVariable were the last three entries; they landed, so they came off.
+const DECLARES_UNIMPLEMENTED: &[&str] = &[];
 
 #[test]
 fn only_the_known_definitions_declare_unimplemented_features() {

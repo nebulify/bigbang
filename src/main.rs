@@ -454,7 +454,7 @@ fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, 
 }
 
 fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -> Result<()> {
-    use bigbang::exec::{run_definition, CommandExecutor, LocalExecutor, SshExecutor};
+    use bigbang::exec::{run_definition_with, CommandExecutor, LocalExecutor, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
     use bigbang::recipe::{resolve_all, Recipe};
     use bigbang::task::TaskDefinition;
@@ -554,7 +554,16 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     Box::new(SshExecutor { target, echo: true, secrets })
                 };
 
-                let outcomes = run_definition(&definition, &merged, executor.as_mut())?;
+                // Functions need more than a shell: where templates live, and a vault to write to.
+                let function_vault = open_vault(profile_ref).ok();
+                let ctx = bigbang::functions::FunctionContext {
+                    resources_root: library_root.join("resources"),
+                    vault: function_vault.as_ref(),
+                    vault_password: &password,
+                    echo: true,
+                };
+                let outcomes =
+                    run_definition_with(&definition, &merged, executor.as_mut(), Some(&ctx))?;
                 for outcome in &outcomes {
                     if let Some(failure) = &outcome.failed {
                         println!("     ✗ {}: {failure}", outcome.task_name);
@@ -592,6 +601,25 @@ fn open_library(profile_ref: &str) -> Result<bigbang::library::Library> {
     Ok(bigbang::library::Library::new(Profile::expand(&profile.library_path)))
 }
 
+/// Copy a directory tree, returning how many files landed.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<usize> {
+    let mut count = 0usize;
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            count += copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn library_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: bool) -> Result<()> {
     let library = open_library(profile_ref)?;
     let mut files = Vec::new();
@@ -613,6 +641,17 @@ fn library_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: 
             }
         }
     }
+    // Templates travel with the definitions that reference them. Installing the JSON and leaving
+    // the resources behind gives a task that parses, runs, and fails at the upload — the failure
+    // arriving on the host rather than here.
+    if source.is_dir() {
+        let resources = source.join("resources");
+        if resources.is_dir() {
+            let copied = copy_tree(&resources, &library.root().join("resources"))?;
+            println!("Resources: {copied} file(s)");
+        }
+    }
+
     println!("Installed: {installed}");
     if failed > 0 {
         anyhow::bail!("{failed} item(s) failed to install");

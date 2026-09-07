@@ -83,6 +83,11 @@ impl Library {
         Self { root: root.into() }
     }
 
+    /// Where the library lives; templates are installed under `<root>/resources`.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn item_file(&self, group: &str, name: &str, version: &str, item_type: ItemType) -> PathBuf {
         self.root
             .join(group)

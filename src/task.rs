@@ -64,6 +64,13 @@ pub struct Task {
     /// Skip the whole task unless this command succeeds.
     #[serde(default)]
     pub condition: Option<String>,
+    /// Work that is not a shell command: putting a file on the host, writing to the vault.
+    ///
+    /// These run **before** the task's commands, which is what the definitions assume — the Clicky
+    /// task's single command is `test -f <path>`, checking that the upload its function performs
+    /// actually landed.
+    #[serde(default)]
+    pub functions: Vec<Function>,
     /// Anything the model does not implement.
     ///
     /// Kept rather than discarded so it can be refused. Silently dropping these is how
@@ -107,9 +114,44 @@ pub struct DetailedCommand {
     /// considered to have succeeded.
     #[serde(default)]
     pub assertions: Vec<Assertion>,
+    /// Keep this command's output in a variable for later commands and functions to use.
+    #[serde(rename = "captureOutput", default)]
+    pub capture_output: Option<bool>,
+    #[serde(rename = "outputVariable", default)]
+    pub output_variable: Option<String>,
     /// Anything the model does not implement — see `Task::extra`.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A unit of work the shell cannot express.
+///
+/// `uploadTemplate` puts a file on the host; `vaultAddItem` writes a secret. Both were declared in
+/// the definitions and silently discarded, so two nginx tasks deployed configuration by not
+/// deploying it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Function {
+    /// Which function to run: `uploadTemplate`, `vaultAddItem`.
+    pub function: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+    /// Where to put whatever the function produces.
+    #[serde(rename = "outputVariable", default)]
+    pub output_variable: Option<String>,
+}
+
+impl Function {
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.function.clone())
+    }
+    /// A parameter with variables already substituted.
+    pub fn param(&self, key: &str, variables: &BTreeMap<String, String>) -> Option<String> {
+        self.params.get(key).map(|v| substitute(v, variables))
+    }
 }
 
 /// A field is only a demand if it asks for something.

@@ -32,6 +32,7 @@
 //! character outside `[A-Za-z0-9._-]` with `-`.
 
 pub mod exec;
+pub mod functions;
 pub mod infra;
 pub mod library;
 pub mod profile;
