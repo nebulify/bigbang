@@ -1028,6 +1028,32 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     continue;
                 }
 
+                // A task's own variables may hold `vault:` references too, and until now nothing
+                // resolved them: only recipe and role variables went through resolve_all, so
+                // setup-pgbackrest wrote the literal text `vault:backup_s3_access_key` into
+                // pgbackrest.conf. Resolved here, at lower precedence than the recipe's, which is
+                // the order run_definition already applies.
+                //
+                // This runs BEFORE the executor is built, and the order is the whole point. The
+                // executor takes a snapshot of the secret list, so resolving task variables after
+                // it was constructed left every task-level secret substituted into commands but
+                // absent from the mask — and the echoed command printed it in clear. That is how
+                // an S3 access key and secret reached a terminal during a test-data run.
+                let task_resolved = resolve_all_in(
+                    &definition
+                        .variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect(),
+                    &vault_root,
+                    profile_vault,
+                    &password,
+                    &overrides,
+                )?;
+                secret_values.extend(task_resolved.secrets.clone());
+                let mut definition = definition.clone();
+                definition.variables = task_resolved.values;
+
                 // Only genuinely secret values are masked — see recipe::Resolved. Masking every
                 // variable made refusal messages unreadable, which is worse than useless when the
                 // message exists to tell an operator what went wrong.
@@ -1045,26 +1071,6 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     _key_guard = key; // keep the temporary key file alive for the whole run
                     Box::new(SshExecutor { target, echo: true, secrets })
                 };
-
-                // A task's own variables may hold `vault:` references too, and until now nothing
-                // resolved them: only recipe and role variables went through resolve_all, so
-                // setup-pgbackrest wrote the literal text `vault:backup_s3_access_key` into
-                // pgbackrest.conf. Resolved here, at lower precedence than the recipe's, which is
-                // the order run_definition already applies.
-                let task_resolved = resolve_all_in(
-                    &definition
-                        .variables
-                        .iter()
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                        .collect(),
-                    &vault_root,
-                    profile_vault,
-                    &password,
-                    &overrides,
-                )?;
-                secret_values.extend(task_resolved.secrets.clone());
-                let mut definition = definition.clone();
-                definition.variables = task_resolved.values;
 
                 // Functions need more than a shell: where templates live, and a vault to write to.
                 let function_vault = open_vault(profile_ref).ok();
