@@ -500,6 +500,20 @@ pub fn substitute(input: &str, variables: &BTreeMap<String, String>) -> String {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             if let Some(end) = input[i + 2..].find('}') {
                 let key = &input[i + 2..i + 2 + end];
+                // A shell script may contain a literal `${` — `case "$v" in *'${'*)` is a real
+                // pattern people write. Without this check the scan found that `${`, searched on
+                // for a closing brace, matched the one belonging to the *next* genuine reference,
+                // and swallowed everything between: a guard comparing against ${forbidden_db} was
+                // left unsubstituted and silently matched nothing. A variable name is an
+                // identifier, so anything else is not a placeholder and the `$` is passed through.
+                let is_name = !key.is_empty()
+                    && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+                if !is_name {
+                    out.push('$');
+                    i += 1;
+                    continue;
+                }
                 match variables.get(key) {
                     Some(value) => out.push_str(value),
                     None => out.push_str(&input[i..i + 2 + end + 1]),
@@ -554,6 +568,37 @@ mod tests {
         assert_eq!(substitute("echo $HOME", &vars()), "echo $HOME");
         assert_eq!(substitute("echo ${unclosed", &vars()), "echo ${unclosed");
         assert_eq!(substitute("cost: 5$", &vars()), "cost: 5$");
+    }
+
+    /// A literal `${` in a shell script used to swallow the next real reference.
+    ///
+    /// `case "$v" in *'${'*)` is a pattern people write to detect an unsubstituted placeholder.
+    /// The scan found that `${`, looked on for a closing brace, matched the one belonging to the
+    /// following genuine `${name}`, and consumed everything between — so a guard comparing against
+    /// a variable was left as literal text and matched nothing. It reported success while checking
+    /// nothing at all.
+    #[test]
+    fn a_literal_dollar_brace_does_not_swallow_the_next_variable() {
+        let mut vars = BTreeMap::new();
+        vars.insert("forbidden_db".to_string(), "db_colistor".to_string());
+
+        let input = r#"case "$v" in *'${'*) exit 1;; '${forbidden_db}') exit 1;; esac"#;
+        let out = substitute(input, &vars);
+        assert!(out.contains("'db_colistor'"), "the real reference must resolve: {out}");
+        assert!(out.contains("*'${'*"), "the literal must survive unchanged: {out}");
+    }
+
+    #[test]
+    fn only_identifiers_are_treated_as_placeholders() {
+        let vars = vars();
+        // Not names: these must pass through rather than being consumed as a reference.
+        assert_eq!(substitute("${ }", &vars), "${ }");
+        assert_eq!(substitute("${a b}", &vars), "${a b}");
+        assert_eq!(substitute("${}", &vars), "${}");
+        // Names, including the dotted form vault items use.
+        let mut dotted = BTreeMap::new();
+        dotted.insert("ai.encryption.key".to_string(), "x".to_string());
+        assert_eq!(substitute("${ai.encryption.key}", &dotted), "x");
     }
 
     fn write_library(root: &Path, coordinate: &str, file: &str, body: &str) {
