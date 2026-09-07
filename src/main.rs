@@ -1046,6 +1046,9 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     resources_root: library_root.join("resources"),
                     vault: function_vault.as_ref(),
                     vault_password: &password,
+                    // Provisioning registers what it created, into the same store the recipe was
+                    // resolved from.
+                    store: Some(&store),
                     echo: true,
                 };
                 let outcomes =

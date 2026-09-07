@@ -19,6 +19,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 
 use crate::exec::{wrap_command, CommandExecutor};
+use crate::repodb::RepoDb;
 use crate::task::{substitute, Function};
 use crate::vault::Vault;
 
@@ -30,6 +31,8 @@ pub struct FunctionContext<'a> {
     /// than a silent skip.
     pub vault: Option<&'a Vault>,
     pub vault_password: &'a dyn Fn() -> Result<String>,
+    /// The store to register provisioned machines into. Absent outside a recipe run.
+    pub store: Option<&'a RepoDb>,
     pub echo: bool,
 }
 
@@ -47,6 +50,8 @@ pub fn run_function(
     match function.function.as_str() {
         "uploadTemplate" => upload_template(function, variables, run_as, ctx, executor),
         "vaultAddItem" => vault_add_item(function, variables, ctx),
+        "registerInstance" => register_instance(function, variables, ctx),
+        "deregisterInstance" => deregister_instance(function, variables, ctx),
         other => bail!(
             "unknown function '{other}' — refusing rather than skipping it, because a function \
              that silently does nothing is how this whole class of fault started"
@@ -175,6 +180,115 @@ fn vault_add_item(
     Ok(())
 }
 
+/// Record a machine this run created, so the inventory is a consequence of provisioning rather
+/// than something transcribed by hand afterwards.
+///
+/// Provisioning previously ended by *printing* what it had made. Someone then read the address off
+/// the screen, edited a JSON file and imported it — three steps, one of them a transcription, and
+/// the reason a stale address once sat in git pointing at an address the provider had reissued.
+///
+/// The fields come from the task's variables, which is where `captureOutput` puts the id and
+/// address the provisioning commands reported.
+fn register_instance(
+    function: &Function,
+    variables: &mut BTreeMap<String, String>,
+    ctx: &FunctionContext,
+) -> Result<()> {
+    let Some(store) = ctx.store else {
+        bail!("registerInstance needs a store, and this run has none");
+    };
+    let name = function
+        .param("name", variables)
+        .context("registerInstance needs 'name'")?;
+
+    let mut instance = serde_json::Map::new();
+    // Everything the caller supplied, minus the empty ones: a parameter left unset is absent, not
+    // a field set to "".
+    for key in function.params.keys() {
+        if let Some(value) = function.param(key, variables) {
+            if !value.trim().is_empty() {
+                instance.insert(key.clone(), serde_json::Value::String(value));
+            }
+        }
+    }
+    // `selectors` is a list everywhere else, so accept the comma-separated form a task variable
+    // can actually carry and convert it.
+    if let Some(serde_json::Value::String(raw)) = instance.get("selectors").cloned() {
+        let list: Vec<serde_json::Value> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .collect();
+        instance.insert("selectors".into(), serde_json::Value::Array(list));
+    }
+    // `sshKeyName` composes the reference rather than carrying it, because a variable whose value
+    // begins with `vault:` is resolved by the recipe before a function ever sees it. That is right
+    // for a password and wrong here: an instance stores the *reference* and resolves it per
+    // connection. Carrying it as a literal produced an inventory entry containing the private key.
+    if let Some(key_name) = function.param("sshKeyName", variables) {
+        let Some(vault) = ctx.vault else {
+            bail!("sshKeyName needs a vault to compose a reference against");
+        };
+        instance.remove("sshKeyName");
+        instance.insert(
+            "sshKeyId".into(),
+            serde_json::Value::String(format!(
+                "vault:{}/{}/{}",
+                vault.account_id, vault.project_code, key_name
+            )),
+        );
+    }
+    instance.entry("id").or_insert_with(|| serde_json::Value::String(name.clone()));
+
+    let value = serde_json::Value::Object(instance);
+    let parsed: crate::infra::Instance =
+        serde_json::from_value(value.clone()).context("the registered instance is not valid")?;
+    // The same guard `infra import` applies. Registering a machine with no address would record
+    // something no recipe can reach, and a half-finished provision is exactly when that happens.
+    crate::infra::validate(&parsed)
+        .with_context(|| format!("refusing to register '{name}'"))?;
+
+    store
+        .write(crate::infra::TYPE_INFRASTRUCTURE, &name, &value)
+        .with_context(|| format!("registering '{name}'"))?;
+    if ctx.echo {
+        println!("[fn] registered '{name}' at {}", parsed.address().unwrap_or_default());
+    }
+    if let Some(var) = &function.output_variable {
+        variables.insert(var.clone(), name);
+    }
+    Ok(())
+}
+
+/// Forget a machine this run destroyed.
+///
+/// Without it the store accumulates entries for machines that no longer exist, and since a provider
+/// reissues addresses, a recipe that later resolves one of those is pointed at somebody else's
+/// host. The payload history stays on disk, so this is reversible.
+fn deregister_instance(
+    function: &Function,
+    variables: &mut BTreeMap<String, String>,
+    ctx: &FunctionContext,
+) -> Result<()> {
+    let Some(store) = ctx.store else {
+        bail!("deregisterInstance needs a store, and this run has none");
+    };
+    let name = function
+        .param("name", variables)
+        .context("deregisterInstance needs 'name'")?;
+    let removed = store
+        .remove(crate::infra::TYPE_INFRASTRUCTURE, &name)
+        .with_context(|| format!("deregistering '{name}'"))?;
+    if ctx.echo {
+        println!(
+            "[fn] {} '{name}'",
+            if removed { "deregistered" } else { "nothing to deregister for" }
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +310,7 @@ mod tests {
             resources_root: root.to_path_buf(),
             vault: None,
             vault_password: &|| Ok("pw".to_string()),
+            store: None,
             echo: false,
         }
     }
@@ -284,6 +399,187 @@ mod tests {
             &mut BTreeMap::new(), None, &ctx(&root), &mut rec,
         ).unwrap_err();
         assert!(format!("{err:#}").contains("escape"), "{err:#}");
+    }
+
+    fn register_fn(params: &[(&str, &str)]) -> Function {
+        Function {
+            function: "registerInstance".into(),
+            name: Some("Register".into()),
+            description: None,
+            params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            output_variable: None,
+        }
+    }
+
+    fn store_at(tag: &str) -> (std::path::PathBuf, RepoDb) {
+        let root = std::env::temp_dir().join(format!("bb-reg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        (root.clone(), RepoDb::new(root, "test", "test"))
+    }
+
+    #[test]
+    fn a_provisioned_machine_registers_itself() {
+        let (root, store) = store_at("ok");
+        let ctx = FunctionContext {
+            resources_root: root.clone(),
+            vault: None,
+            vault_password: &|| Ok("pw".into()),
+            store: Some(&store),
+            echo: false,
+        };
+        // The address arrives through a variable, which is where captureOutput puts it.
+        let mut vars = BTreeMap::new();
+        vars.insert("found_ip".to_string(), "203.0.113.7".to_string());
+
+        run_function(
+            &register_fn(&[
+                ("name", "int-base-1"),
+                ("projectId", "proj-1"),
+                ("publicIpAddress", "${found_ip}"),
+                ("sshUsername", "debian"),
+                ("sshKeyId", "vault:colistor/colistor-int/colistor-int-ssh-key"),
+                ("selectors", "database-server, vps , int"),
+            ]),
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+        )
+        .unwrap();
+
+        let loaded = crate::infra::load_instances(&store).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "int-base-1");
+        assert_eq!(loaded[0].address().unwrap(), "203.0.113.7", "the captured address must land");
+        // A comma-separated variable becomes the list every other part of the model expects.
+        assert_eq!(
+            loaded[0].selectors.clone().unwrap(),
+            vec!["database-server", "vps", "int"],
+            "selectors should be split and trimmed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A recipe variable holding `vault:...` is resolved to the secret before a function sees it,
+    /// so an instance must compose its key reference from a name instead. The first run of this
+    /// wrote the private key itself into the inventory entry.
+    #[test]
+    fn a_key_reference_is_composed_rather_than_carried() {
+        let (root, store) = store_at("keyref");
+        let vault = Vault::new(root.join("v"), "colistor", "colistor-int");
+        let ctx = FunctionContext {
+            resources_root: root.clone(), vault: Some(&vault),
+            vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
+        };
+        run_function(
+            &register_fn(&[
+                ("name", "int-base-1"), ("projectId", "proj-1"),
+                ("publicIpAddress", "203.0.113.7"), ("sshUsername", "debian"),
+                ("sshKeyName", "colistor-int-ssh-key"),
+            ]),
+            &mut BTreeMap::new(), None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+        )
+        .unwrap();
+
+        let loaded = crate::infra::load_instances(&store).unwrap();
+        assert_eq!(
+            loaded[0].ssh_key_id.as_deref(),
+            Some("vault:colistor/colistor-int/colistor-int-ssh-key"),
+            "the reference should be composed from the vault's own account and project"
+        );
+        assert!(!format!("{:?}", loaded[0]).contains("PRIVATE KEY"), "a key body reached the store");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failure this guards: a provision that half-worked. Registering a machine with no
+    /// address records something no recipe can reach, and the run reports success.
+    #[test]
+    fn a_machine_with_no_address_is_not_registered() {
+        let (root, store) = store_at("noaddr");
+        let ctx = FunctionContext {
+            resources_root: root.clone(), vault: None,
+            vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
+        };
+        // The capture found nothing, so the variable resolves to empty.
+        let mut vars = BTreeMap::new();
+        vars.insert("found_ip".to_string(), "".to_string());
+
+        let err = run_function(
+            &register_fn(&[
+                ("name", "half-built"),
+                ("projectId", "proj-1"),
+                ("publicIpAddress", "${found_ip}"),
+                ("sshUsername", "debian"),
+                ("sshKeyId", "file:/k"),
+            ]),
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("half-built"), "{err:#}");
+        assert!(crate::infra::load_instances(&store).unwrap().is_empty(), "nothing should be stored");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registering_twice_replaces_rather_than_duplicates() {
+        let (root, store) = store_at("twice");
+        let ctx = FunctionContext {
+            resources_root: root.clone(), vault: None,
+            vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
+        };
+        let mut vars = BTreeMap::new();
+        for address in ["203.0.113.7", "203.0.113.9"] {
+            run_function(
+                &register_fn(&[
+                    ("name", "int-base-1"), ("projectId", "proj-1"),
+                    ("publicIpAddress", address), ("sshUsername", "debian"), ("sshKeyId", "file:/k"),
+                ]),
+                &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+            )
+            .unwrap();
+        }
+        let loaded = crate::infra::load_instances(&store).unwrap();
+        assert_eq!(loaded.len(), 1, "a re-run must not duplicate the machine");
+        assert_eq!(loaded[0].address().unwrap(), "203.0.113.9", "the newer address should win");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Without this the store keeps machines that no longer exist, and a provider that reissues
+    /// addresses turns a ghost entry into someone else's host.
+    #[test]
+    fn destroying_a_machine_deregisters_it() {
+        let (root, store) = store_at("dereg");
+        let ctx = FunctionContext {
+            resources_root: root.clone(), vault: None,
+            vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
+        };
+        let mut vars = BTreeMap::new();
+        run_function(
+            &register_fn(&[
+                ("name", "doomed"), ("projectId", "proj-1"),
+                ("publicIpAddress", "203.0.113.7"), ("sshUsername", "debian"), ("sshKeyId", "file:/k"),
+            ]),
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+        )
+        .unwrap();
+        assert_eq!(crate::infra::load_instances(&store).unwrap().len(), 1);
+
+        let mut dereg = register_fn(&[("name", "doomed")]);
+        dereg.function = "deregisterInstance".into();
+        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 }).unwrap();
+        assert!(crate::infra::load_instances(&store).unwrap().is_empty(), "the ghost survived");
+
+        // Deregistering something absent is not an error: destroy runs after a failed provision too.
+        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 }).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registering_without_a_store_is_refused_rather_than_skipped() {
+        let err = run_function(
+            &register_fn(&[("name", "x"), ("projectId", "p"), ("publicIpAddress", "1.2.3.4")]),
+            &mut BTreeMap::new(), None, &ctx(Path::new("/tmp")),
+            &mut Recorder { seen: vec![], code: 0 },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("needs a store"), "{err:#}");
     }
 
     #[test]

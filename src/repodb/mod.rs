@@ -151,6 +151,24 @@ impl RepoDb {
         Ok(payload_path)
     }
 
+    /// Remove an object from the store by deleting its pointer.
+    ///
+    /// The payload versions are left where they are. Enumeration is by `.rev` file, so the object
+    /// disappears from every listing while its history remains on disk — a deregistration that can
+    /// be undone by writing the pointer back, which matters when the thing being deregistered is a
+    /// machine somebody may have destroyed by mistake.
+    ///
+    /// Returns whether there was anything to remove.
+    pub fn remove(&self, object_type: &str, name: &str) -> Result<bool> {
+        let pointer = self.pointer_path(object_type, name);
+        if !pointer.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&pointer)
+            .with_context(|| format!("removing {}", pointer.display()))?;
+        Ok(true)
+    }
+
     /// temp + atomic rename, so a reader never observes a half-written pointer.
     fn write_pointer(&self, object_type: &str, safe: &str, relative: &str) -> Result<()> {
         let dir = self.type_dir(object_type);
