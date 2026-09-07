@@ -134,8 +134,16 @@ enum VaultOp {
     Add {
         #[arg(long = "item-id")]
         item_id: String,
-        #[arg(long)]
-        data: String,
+        /// The value itself. Visible in `ps` for the life of the process — prefer --data-file or
+        /// --stdin for anything that is actually secret.
+        #[arg(long, conflicts_with_all = ["data_file", "stdin"])]
+        data: Option<String>,
+        /// Read the value from a file, so it never appears in a process listing.
+        #[arg(long = "data-file", conflicts_with_all = ["data", "stdin"])]
+        data_file: Option<PathBuf>,
+        /// Read the value from standard input.
+        #[arg(long, conflicts_with_all = ["data", "data_file"])]
+        stdin: bool,
         #[arg(long = "type", default_value = "PASSWORD")]
         type_: String,
         #[arg(long)]
@@ -244,8 +252,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Vault { operation } => match operation {
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
-            VaultOp::Add { item_id, data, type_, description, profile } => {
-                vault_add(&item_id, &data, &type_, description.as_deref(), &profile)
+            VaultOp::Add { item_id, data, data_file, stdin, type_, description, profile } => {
+                vault_add(&item_id, data.as_deref(), data_file.as_deref(), stdin, &type_, description.as_deref(), &profile)
             }
         },
     }
@@ -445,11 +453,41 @@ fn recipe_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: b
     Ok(())
 }
 
-fn vault_add(item_id: &str, data: &str, type_: &str, description: Option<&str>, profile_ref: &str) -> Result<()> {
+/// The value comes from exactly one of: --data, --data-file, or stdin.
+///
+/// A private key passed as --data sits in the process's argv, where anything else on the machine
+/// can read it out of `ps` for as long as the command runs. A file or stdin costs nothing and
+/// closes that, which matters because the natural first use of this command is storing an SSH key.
+fn vault_add(
+    item_id: &str,
+    data: Option<&str>,
+    data_file: Option<&std::path::Path>,
+    stdin: bool,
+    type_: &str,
+    description: Option<&str>,
+    profile_ref: &str,
+) -> Result<()> {
+    let value = match (data, data_file, stdin) {
+        (Some(d), _, _) => d.to_string(),
+        (_, Some(path), _) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?,
+        (_, _, true) => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).context("reading the value from stdin")?;
+            buf
+        }
+        _ => anyhow::bail!("supply the value with --data, --data-file <path>, or --stdin"),
+    };
+    if value.trim().is_empty() {
+        anyhow::bail!("refusing to store an empty value as '{item_id}'");
+    }
+
     let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
-    vault.add(item_id, type_, description, data, &password)?;
-    println!("✓ Added vault item: {item_id}");
+    vault.add(item_id, type_, description, &value, &password)?;
+    // Deliberately reports the length rather than any part of the value.
+    println!("✓ Added vault item: {item_id} ({} bytes, {type_})", value.len());
     Ok(())
 }
 
