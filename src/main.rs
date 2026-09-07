@@ -130,6 +130,36 @@ enum VaultOp {
         #[arg(long)]
         profile: String,
     },
+    /// Hold the vault open in a background agent, so the password is typed once
+    Unlock {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+        /// Only these items are unlocked. Without it, every item in the vault is.
+        #[arg(long = "item", value_name = "NAME")]
+        items: Vec<String>,
+        /// How long before the agent exits on its own.
+        #[arg(long, default_value_t = 3600)]
+        ttl: u64,
+        /// Append every request to this file. Commands and item names, never values.
+        #[arg(long)]
+        audit: Option<PathBuf>,
+        /// Run in the foreground instead of detaching.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the agent for a profile
+    Lock {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+    },
+    /// Whether an agent is holding this profile open
+    Status {
+        /// Profile name (looked up in ~/.bigbang/profiles) or a path to a profile file
+        #[arg(long)]
+        profile: String,
+    },
     /// Add an item to the vault
     Add {
         #[arg(long = "item-id")]
@@ -271,6 +301,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             InfraOp::Import { source, profile, force } => infra_import(&source, &profile, force),
         },
         Command::Vault { operation } => match operation {
+            VaultOp::Unlock { profile, items, ttl, audit, foreground } => {
+                vault_unlock(&profile, &items, ttl, audit, foreground)
+            }
+            VaultOp::Lock { profile } => vault_lock(&profile),
+            VaultOp::Status { profile } => vault_status(&profile),
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
             VaultOp::Add {
@@ -485,6 +520,108 @@ fn recipe_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: b
 /// A private key passed as --data sits in the process's argv, where anything else on the machine
 /// can read it out of `ps` for as long as the command runs. A file or stdin costs nothing and
 /// closes that, which matters because the natural first use of this command is storing an SSH key.
+fn vault_unlock(
+    profile_ref: &str,
+    wanted: &[String],
+    ttl_secs: u64,
+    audit: Option<PathBuf>,
+    foreground: bool,
+) -> Result<()> {
+    use bigbang::agent;
+    let profile = Profile::open(profile_ref)?;
+    let socket = agent::socket_path(&profile.name);
+    if agent::is_running(&socket) {
+        anyhow::bail!("'{}' is already unlocked. Stop it with: bigbang vault lock --profile {profile_ref}", profile.name);
+    }
+
+    let vault = open_vault(profile_ref)?;
+    let password = vault_password()?;
+    let mut items = std::collections::BTreeMap::new();
+    for (name, _type) in vault.list()? {
+        // An allowlist is the strongest part of this: what is not unlocked cannot be used by
+        // mistake, whatever the command says.
+        if !wanted.is_empty() && !wanted.iter().any(|w| w == &name) {
+            continue;
+        }
+        if let Some(value) = vault.get(&name, &password)? {
+            items.insert(name, value);
+        }
+    }
+    if items.is_empty() {
+        anyhow::bail!("nothing to unlock — no item matched");
+    }
+    for name in wanted {
+        if !items.contains_key(name) {
+            anyhow::bail!("'{name}' is not in this vault; nothing was unlocked");
+        }
+    }
+
+    println!("🔓 {} unlocked: {} item(s), {} minutes", profile.name, items.len(), ttl_secs / 60);
+    for name in items.keys() {
+        println!("   {name}");
+    }
+    println!("   socket {}", socket.display());
+    println!("   use it with: bb -- <command with {{{{item-name}}}}>");
+
+    if foreground {
+        return agent::serve(&socket, items, std::time::Duration::from_secs(ttl_secs), audit);
+    }
+
+    // Detach by re-executing ourselves in the foreground with the password in the child's
+    // environment. The password is not on the command line, so it is not in `ps`.
+    let exe = std::env::current_exe().context("finding this executable")?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("vault").arg("unlock")
+        .arg("--profile").arg(profile_ref)
+        .arg("--ttl").arg(ttl_secs.to_string())
+        .arg("--foreground")
+        .env("BIGBANG_VAULT_PASSWORD", &password)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for name in wanted {
+        command.arg("--item").arg(name);
+    }
+    if let Some(path) = &audit {
+        command.arg("--audit").arg(path);
+    }
+    command.spawn().context("starting the agent")?;
+
+    for _ in 0..100 {
+        if agent::is_running(&socket) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("the agent did not come up on {}", socket.display());
+}
+
+fn vault_lock(profile_ref: &str) -> Result<()> {
+    use bigbang::agent;
+    let profile = Profile::open(profile_ref)?;
+    let socket = agent::socket_path(&profile.name);
+    if !socket.exists() {
+        println!("'{}' is not unlocked", profile.name);
+        return Ok(());
+    }
+    std::fs::remove_file(&socket).with_context(|| format!("removing {}", socket.display()))?;
+    println!("🔒 {} locked", profile.name);
+    Ok(())
+}
+
+fn vault_status(profile_ref: &str) -> Result<()> {
+    use bigbang::agent;
+    let profile = Profile::open(profile_ref)?;
+    let socket = agent::socket_path(&profile.name);
+    if agent::is_running(&socket) {
+        println!("🔓 {} is unlocked ({})", profile.name, socket.display());
+    } else {
+        println!("🔒 {} is locked", profile.name);
+    }
+    Ok(())
+}
+
 /// Everything the --generate family carries.
 struct GenerateOptions {
     generate: bool,

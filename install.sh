@@ -36,6 +36,9 @@ else
   ( cd "$REPO/bigbang-rs" && cargo build ) || die "cargo build failed"
 fi
 SRC="$REPO/bigbang-rs/target/$PROFILE/bigbang"
+# bb is the client for the unlocked-vault agent; it is useless without bigbang and useless if it
+# is not on PATH beside it, so the two are installed together or not at all.
+SRC_BB="$REPO/bigbang-rs/target/$PROFILE/bb"
 [ -x "$SRC" ] || die "expected a binary at $SRC"
 ok "$SRC ($(du -h "$SRC" | cut -f1))"
 
@@ -59,6 +62,9 @@ fi
 mkdir -p "$TARGET_DIR"
 install -m 0755 "$SRC" "$TARGET_DIR/bigbang"
 ok "$TARGET_DIR/bigbang"
+[ -f "$SRC_BB" ] || die "bb was not built — expected $SRC_BB"
+install -m 0755 "$SRC_BB" "$TARGET_DIR/bb"
+ok "$TARGET_DIR/bb"
 
 # There is one bigbang: the one just built. Any other copy sitting on PATH is a leftover that
 # would shadow this one depending on directory order, so overwrite them all with the same
@@ -78,7 +84,8 @@ for dir in "${path_dirs[@]}"; do
   [ "$candidate" -ef "$TARGET_DIR/bigbang" ] && continue
   # Only touch it if it actually differs, so a re-run is quiet and honest.
   cmp -s "$SRC" "$candidate" && continue
-  install -m 0755 "$SRC" "$candidate" 2>/dev/null && { ok "replaced older copy at $candidate"; replaced=$((replaced+1)); } \
+  install -m 0755 "$SRC" "$candidate" 2>/dev/null && { ok "replaced older copy at $candidate"; replaced=$((replaced+1)); \
+    [ -e "$resolved_dir/bb" ] && install -m 0755 "$SRC_BB" "$resolved_dir/bb" 2>/dev/null; } \
     || warn "could not replace $candidate (permissions?) — remove it manually"
 done
 [ "$replaced" = 0 ] || ok "$replaced other cop$([ "$replaced" = 1 ] && echo y || echo ies) brought up to date"
@@ -105,6 +112,8 @@ else
 fi
 
 say "Ready"
+echo "   bigbang vault unlock --profile P  hold the vault open; type the password once"
+echo "   bb --profile P --env PW={{item}} -- <command>"
 echo "   bigbang shell                    interactive: load a profile once, then work"
 echo "   bigbang recipe list --profile P"
 echo "   bigbang recipe execute --id R --profile P --dry-run"
