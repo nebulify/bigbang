@@ -606,9 +606,38 @@ impl Vault {
         password: &str,
         metadata: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String> {
+        self.add_or_replace(name, type_, description, plain_text, password, metadata, false)
+    }
+
+    /// Add, or rotate an existing item in place.
+    ///
+    /// Rotation is a normal operation — a leaked key, a test value replaced by a real one — and
+    /// there was no way to do it: `add` refused, and nothing else wrote items. The only route was
+    /// editing the vault file, which for a v2 vault is not possible at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_or_replace(
+        &self,
+        name: &str,
+        type_: &str,
+        description: Option<&str>,
+        plain_text: &str,
+        password: &str,
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
+        replace: bool,
+    ) -> Result<String> {
         let mut items = self.read_items_with(Some(password))?;
-        if items.iter().any(|i| i.name == name) {
-            bail!("Vault item already exists: {name}");
+        // Rotation keeps the item's id and its original createdAt, so anything referencing it by id
+        // rather than by name keeps working and the record still says when it first existed.
+        // Removing and re-adding would issue a new id and silently break those references.
+        let mut reuse_id: Option<String> = None;
+        let mut reuse_created: Option<serde_json::Value> = None;
+        if let Some(existing) = items.iter().position(|i| i.name == name) {
+            if !replace {
+                bail!("Vault item already exists: {name} — pass --replace to rotate it");
+            }
+            reuse_id = Some(items[existing].id.clone());
+            reuse_created = items[existing].rest.get("createdAt").cloned();
+            items.remove(existing);
         }
 
         let payload = encrypt(password, plain_text)?;
@@ -622,7 +651,10 @@ impl Vault {
             }
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
+        if let Some(when) = reuse_created {
+            rest.insert("createdAt".into(), when);
+        }
+        let id = reuse_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         items.push(VaultItem {
             id: id.clone(),
             name: name.to_string(),

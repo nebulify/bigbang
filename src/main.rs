@@ -181,6 +181,9 @@ enum VaultOp {
         /// Read the value from a file, so it never appears in a process listing.
         #[arg(long = "data-file", conflicts_with_all = ["data", "stdin"])]
         data_file: Option<PathBuf>,
+        /// Rotate an item that already exists, keeping its id.
+        #[arg(long)]
+        replace: bool,
         /// Read the value from standard input.
         #[arg(long, conflicts_with_all = ["data", "data_file"])]
         stdin: bool,
@@ -327,10 +330,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
             VaultOp::Add {
-                item_id, data, data_file, stdin, generate, length, min_length, max_length,
+                item_id, data, data_file, stdin, replace, generate, length, min_length, max_length,
                 special, charset, comment, restriction, prepared_file, type_, description, profile,
             } => vault_add(
-                &item_id, data.as_deref(), data_file.as_deref(), stdin,
+                &item_id, data.as_deref(), data_file.as_deref(), stdin, replace,
                 GenerateOptions { generate, length, min_length, max_length, special,
                                   charset: charset.clone(), comment: comment.clone() },
                 &restriction, prepared_file.as_deref(),
@@ -818,6 +821,7 @@ fn vault_add(
     data: Option<&str>,
     data_file: Option<&std::path::Path>,
     stdin: bool,
+    replace: bool,
     gen: GenerateOptions,
     restriction: &str,
     prepared_file: Option<&std::path::Path>,
@@ -914,7 +918,7 @@ fn vault_add(
         meta.insert("preparedCommands".to_string(), serde_json::to_value(&prepared)?);
     }
     let metadata = if meta.is_empty() { None } else { Some(meta) };
-    vault.add_with_metadata(item_id, type_, description, &value, &password, metadata)?;
+    vault.add_or_replace(item_id, type_, description, &value, &password, metadata, replace)?;
 
     // Deliberately reports the length rather than any part of the value.
     println!("✓ Added vault item: {item_id} ({} bytes, {type_})", value.len());
