@@ -311,6 +311,17 @@ pub fn resolve_all(
         }
         out.values.insert(key.clone(), resolved);
     }
+    // A --var naming something the recipe does not declare still applies.
+    //
+    // It used to be dropped: the loop above only ever consulted overrides for keys already in the
+    // map, so `--var db_host=...` against a recipe with no db_host default did nothing at all and
+    // the run proceeded with the placeholder unsubstituted. That is the shape of bug this
+    // repository keeps finding — an instruction accepted, ignored, and reported as success — and
+    // it appeared the moment a dangerous default was removed, which is exactly when someone would
+    // be supplying the value by hand.
+    for (key, supplied) in overrides {
+        out.values.entry(key.clone()).or_insert_with(|| supplied.clone());
+    }
     Ok(out)
 }
 
@@ -320,6 +331,33 @@ mod value_tests {
 
     fn no_password() -> anyhow::Result<String> {
         anyhow::bail!("should not be asked")
+    }
+
+    /// `--var` must be able to introduce a variable, not only replace a declared one. Removing a
+    /// dangerous default is precisely when a value is supplied by hand, and dropping it silently
+    /// left the placeholder unsubstituted in the command.
+    #[test]
+    fn an_override_applies_even_when_the_recipe_declares_nothing() {
+        let declared = BTreeMap::new();
+        let mut overrides = BTreeMap::new();
+        overrides.insert("db_host".to_string(), "10.0.0.9".to_string());
+
+        let resolved = resolve_all(&declared, "/nonexistent", &no_password, &overrides).unwrap();
+        assert_eq!(resolved.values.get("db_host").map(String::as_str), Some("10.0.0.9"));
+    }
+
+    #[test]
+    fn a_declared_variable_loses_to_an_override_and_survives_without_one() {
+        let mut declared = BTreeMap::new();
+        declared.insert("db_name".to_string(), serde_json::Value::String("from_recipe".into()));
+
+        let resolved = resolve_all(&declared, "/nonexistent", &no_password, &BTreeMap::new()).unwrap();
+        assert_eq!(resolved.values["db_name"], "from_recipe");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("db_name".to_string(), "from_flag".to_string());
+        let resolved = resolve_all(&declared, "/nonexistent", &no_password, &overrides).unwrap();
+        assert_eq!(resolved.values["db_name"], "from_flag", "--var must beat the recipe");
     }
 
     #[test]
