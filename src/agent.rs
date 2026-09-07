@@ -42,6 +42,44 @@ pub struct UnlockedItem {
     pub prepared: Vec<crate::vault::PreparedCommand>,
 }
 
+/// Where the agent can re-read the vault from when it is asked for something it does not hold.
+#[derive(Debug, Clone)]
+pub struct VaultSource {
+    pub root: String,
+    pub account: String,
+    pub project: String,
+    /// The allowlist given at unlock. Re-reading must not quietly widen it.
+    pub wanted: Vec<String>,
+}
+
+/// Decrypt a vault into the map the agent serves.
+///
+/// Shared by `vault unlock` and by the agent's own reload, so the allowlist and the handling of the
+/// `always` tier cannot drift between the two.
+pub fn load_items(
+    vault: &crate::vault::Vault,
+    password: &str,
+    wanted: &[String],
+) -> Result<(BTreeMap<String, UnlockedItem>, Vec<String>)> {
+    let mut items = BTreeMap::new();
+    let mut withheld = Vec::new();
+    for item in vault.read_items_with(Some(password))? {
+        let name = item.name.clone();
+        if !wanted.is_empty() && !wanted.iter().any(|w| w == &name) {
+            continue;
+        }
+        let restriction = item.restriction();
+        if restriction == crate::vault::Restriction::Always {
+            withheld.push(name);
+            continue;
+        }
+        if let Some(value) = vault.get(&name, password)? {
+            items.insert(name, UnlockedItem { value, restriction, prepared: item.prepared_commands() });
+        }
+    }
+    Ok((items, withheld))
+}
+
 /// Invoking a capability rather than composing a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunPrepared {
@@ -397,9 +435,11 @@ pub fn serve(
     path: &Path,
     items: BTreeMap<String, UnlockedItem>,
     password: String,
+    source: Option<VaultSource>,
     ttl: Duration,
     audit: Option<PathBuf>,
 ) -> Result<()> {
+    let mut items = items;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         set_mode(parent, 0o700)?;
@@ -427,7 +467,7 @@ pub fn serve(
                 // Back to blocking for the conversation itself; the non-blocking mode exists only
                 // so that waiting for a connection can also watch the clock.
                 stream.set_nonblocking(false)?;
-                serve_one(stream, &items, &password, audit.as_deref());
+                serve_one(stream, &mut items, &password, source.as_ref(), audit.as_deref());
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if SystemTime::now() >= deadline {
@@ -445,7 +485,26 @@ pub fn serve(
     }
 }
 
-fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, password: &str, audit: Option<&Path>) {
+/// Names a request refers to, so a miss can be detected before refusing.
+fn referenced(request: &AgentRequest) -> Vec<String> {
+    if let Some(run) = &request.run_prepared {
+        return vec![run.item.clone()];
+    }
+    request
+        .argv
+        .iter()
+        .chain(request.env.values())
+        .flat_map(|t| placeholders(t))
+        .collect()
+}
+
+fn serve_one(
+    mut stream: UnixStream,
+    items: &mut BTreeMap<String, UnlockedItem>,
+    password: &str,
+    source: Option<&VaultSource>,
+    audit: Option<&Path>,
+) {
     let Ok(clone) = stream.try_clone() else { return };
     let mut reader = BufReader::new(clone);
     let mut line = String::new();
@@ -456,6 +515,23 @@ fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, pas
         Ok(request) => {
             if let Some(log) = audit {
                 append_audit(log, &request);
+            }
+            // An item added to the vault after unlocking is not in the snapshot. Re-reading on a
+            // miss beats making someone lock and unlock to pick it up — and it cannot widen the
+            // allowlist, because the same `wanted` list is applied again.
+            if let Some(source) = source {
+                let missing: Vec<String> = referenced(&request)
+                    .into_iter()
+                    .filter(|name| !items.contains_key(name))
+                    .collect();
+                if !missing.is_empty() {
+                    let vault = crate::vault::Vault::new(
+                        source.root.clone(), source.account.clone(), source.project.clone(),
+                    );
+                    if let Ok((fresh, _)) = load_items(&vault, password, &source.wanted) {
+                        *items = fresh;
+                    }
+                }
             }
             handle(&request, items, password)
         }
@@ -822,7 +898,7 @@ mod tests {
 
         let serve_path = path.clone();
         let handle_thread = std::thread::spawn(move || {
-            let _ = serve(&serve_path, items(), "pw".into(), Duration::from_secs(20), None);
+            let _ = serve(&serve_path, items(), "pw".into(), None, Duration::from_secs(20), None);
         });
         // Wait for the socket rather than sleeping a guessed interval.
         for _ in 0..100 {
@@ -860,7 +936,7 @@ mod tests {
 
         let serve_path = path.clone();
         std::thread::spawn(move || {
-            let _ = serve(&serve_path, BTreeMap::new(), "pw".into(), Duration::from_secs(10), None);
+            let _ = serve(&serve_path, BTreeMap::new(), "pw".into(), None, Duration::from_secs(10), None);
         });
         for _ in 0..100 {
             if is_running(&path) {

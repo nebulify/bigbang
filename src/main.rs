@@ -637,34 +637,7 @@ fn vault_unlock(
 
     let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
-    let mut items = std::collections::BTreeMap::new();
-    let mut withheld: Vec<String> = Vec::new();
-    // With the password in hand: a v2 vault cannot be enumerated without it, and unlocking is
-    // precisely the moment it is available.
-    for item in vault.read_items_with(Some(&password))? {
-        let name = item.name.clone();
-        // An allowlist is the strongest part of this: what is not unlocked cannot be used by
-        // mistake, whatever the command says.
-        if !wanted.is_empty() && !wanted.iter().any(|w| w == &name) {
-            continue;
-        }
-        let restriction = item.restriction();
-        if restriction == bigbang::vault::Restriction::Always {
-            // The whole point of the tier: this one is never delegated.
-            withheld.push(name);
-            continue;
-        }
-        if let Some(value) = vault.get(&name, &password)? {
-            items.insert(
-                name,
-                bigbang::agent::UnlockedItem {
-                    value,
-                    restriction,
-                    prepared: item.prepared_commands(),
-                },
-            );
-        }
-    }
+    let (items, withheld) = bigbang::agent::load_items(&vault, &password, wanted)?;
     if items.is_empty() {
         anyhow::bail!("nothing to unlock — no item matched");
     }
@@ -695,7 +668,16 @@ fn vault_unlock(
     println!("   use it with: bb -- <command with {{{{item-name}}}}>");
 
     if foreground {
-        return agent::serve(&socket, items, password, std::time::Duration::from_secs(ttl_secs), audit);
+        let source = agent::VaultSource {
+            root: Profile::expand(&profile.vault_path),
+            account: profile.account_code.clone(),
+            project: profile.default_vault_name.clone(),
+            wanted: wanted.to_vec(),
+        };
+        return agent::serve(
+            &socket, items, password, Some(source),
+            std::time::Duration::from_secs(ttl_secs), audit,
+        );
     }
 
     // Detach by re-executing ourselves in the foreground with the password in the child's
@@ -854,6 +836,9 @@ fn vault_add(
     };
     // A prepared item with no commands is unreachable: nothing may substitute it and there is
     // nothing to invoke. Storing it would look like protection and be a dead credential.
+    for command in &prepared {
+        command.validate()?;
+    }
     if restriction == bigbang::vault::Restriction::Prepared && prepared.is_empty() {
         anyhow::bail!(
             "--restriction prepared needs --prepared-file: without a command the item cannot be \
