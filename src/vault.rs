@@ -44,6 +44,15 @@ const KEY_LENGTH: usize = 32; // 256 bits
 /// alphabet would buy.
 const SECRET_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+/// Special characters `--special` adds.
+///
+/// Every one of these is unreserved in RFC 3986 or safe as a literal in a quoted shell word. The
+/// obvious candidates are missing on purpose: `@` `:` `/` end the userinfo or authority section of
+/// a URL and break a JDBC connection string; `$` `` ` `` `\` `"` `'` are interpreted inside double
+/// quotes; `!` is history expansion in an interactive shell; `%` collides with URL encoding. A
+/// password containing those works until the day it is pasted somewhere that parses it.
+pub const SAFE_SPECIALS: &str = "-_.~+=";
+
 /// A random secret, drawn from the OS CSPRNG.
 ///
 /// The point of generating rather than supplying is that the value never exists anywhere else: not
@@ -72,6 +81,113 @@ pub fn generate_secret(length: usize) -> String {
         }
     }
     out
+}
+
+/// A secret of a length chosen uniformly in `[min, max]`, over the alphanumerics plus `extra`.
+///
+/// Two details that a naive version gets wrong:
+///
+/// * **The length is drawn uniformly too**, so a range is a range rather than a hint. `min == max`
+///   gives a fixed length.
+/// * **Requested specials are guaranteed to appear.** With six specials in a 68-character alphabet,
+///   a 32-character password contains none about 6% of the time. A policy that asks for a symbol
+///   and gets one 94% of the time is a policy that fails in production, on a Friday, for one
+///   account.
+pub fn generate_secret_in_range(min: usize, max: usize, extra: &str) -> Result<String> {
+    if min == 0 || max == 0 {
+        bail!("length must be positive");
+    }
+    if min > max {
+        bail!("--min-length {min} is greater than --max-length {max}");
+    }
+    let mut alphabet: Vec<u8> = SECRET_ALPHABET.to_vec();
+    for byte in extra.bytes() {
+        if byte.is_ascii_whitespace() {
+            bail!("whitespace cannot be part of a generated secret");
+        }
+        if !alphabet.contains(&byte) {
+            alphabet.push(byte);
+        }
+    }
+
+    let length = if min == max { min } else { min + uniform_below(max - min + 1) };
+    let mut chars: Vec<u8> = (0..length).map(|_| alphabet[uniform_below(alphabet.len())]).collect();
+
+    // Guarantee at least one of each requested special, placed at distinct random positions.
+    let specials: Vec<u8> = extra.bytes().collect();
+    if !specials.is_empty() {
+        if length < specials.len() {
+            bail!(
+                "cannot guarantee {} special character(s) in a secret of length {length}",
+                specials.len()
+            );
+        }
+        let mut used: Vec<usize> = Vec::new();
+        for special in &specials {
+            // Reserve the position when a special is already there by chance. Merely skipping
+            // meant a later special could be written over it, quietly undoing the guarantee for
+            // the first one — which is what the test caught.
+            if let Some(found) = chars
+                .iter()
+                .enumerate()
+                .find(|(i, c)| *c == special && !used.contains(i))
+                .map(|(i, _)| i)
+            {
+                used.push(found);
+                continue;
+            }
+            let mut position = uniform_below(length);
+            while used.contains(&position) {
+                position = uniform_below(length);
+            }
+            chars[position] = *special;
+            used.push(position);
+        }
+    }
+
+    Ok(String::from_utf8(chars).expect("alphabet is ASCII"))
+}
+
+/// A uniform value in `0..n`, rejection-sampled for the same reason the alphabet is.
+fn uniform_below(n: usize) -> usize {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    assert!(n > 0);
+    if n == 1 {
+        return 0;
+    }
+    let limit = u32::MAX - (u32::MAX % n as u32);
+    loop {
+        let value = OsRng.next_u32();
+        if value < limit {
+            return (value % n as u32) as usize;
+        }
+    }
+}
+
+/// An Ed25519 keypair: the private half for the vault, the public half for whoever needs it.
+///
+/// Ed25519 rather than RSA because OpenSSH, OVH and every cloud provider that matters accept it,
+/// the keys are short, and there is no key size to get wrong.
+///
+/// Generated in memory. `ssh-keygen` would have been fewer lines and would have written the private
+/// key to a file first, which is exactly the exposure this feature exists to remove.
+pub fn generate_ssh_key(comment: &str) -> Result<(String, String)> {
+    use ssh_key::{rand_core::OsRng as SshOsRng, Algorithm, LineEnding, PrivateKey};
+
+    let mut key = PrivateKey::random(&mut SshOsRng, Algorithm::Ed25519)
+        .map_err(|e| anyhow::anyhow!("generating an Ed25519 key: {e}"))?;
+    key.set_comment(comment);
+
+    let private = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("encoding the private key: {e}"))?
+        .to_string();
+    let public = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| anyhow::anyhow!("encoding the public key: {e}"))?;
+    Ok((private, public))
 }
 const IV_LENGTH: usize = 12;
 const SALT_LENGTH: usize = 16;
@@ -266,6 +382,76 @@ mod tests {
     }
 
     #[test]
+    fn a_length_range_produces_lengths_across_the_whole_range() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let s = generate_secret_in_range(16, 24, "").unwrap();
+            assert!((16..=24).contains(&s.len()), "out of range: {}", s.len());
+            seen.insert(s.len());
+        }
+        // A "range" that always returns the minimum would satisfy the bounds check above.
+        assert!(seen.len() >= 8, "lengths seen: {seen:?}");
+        assert!(seen.contains(&16) && seen.contains(&24), "endpoints unreachable: {seen:?}");
+
+        // min == max is an exact length, not a range.
+        assert_eq!(generate_secret_in_range(20, 20, "").unwrap().len(), 20);
+    }
+
+    /// Six specials in a 68-character alphabet means a 32-character secret contains none about 6%
+    /// of the time. "Usually has a symbol" is not what a password policy means.
+    #[test]
+    fn every_requested_special_actually_appears() {
+        for _ in 0..300 {
+            let s = generate_secret_in_range(20, 20, SAFE_SPECIALS).unwrap();
+            for special in SAFE_SPECIALS.chars() {
+                assert!(s.contains(special), "{special:?} missing from {s}");
+            }
+            assert_eq!(s.len(), 20, "guaranteeing specials must not change the length");
+        }
+    }
+
+    #[test]
+    fn generation_refuses_what_it_cannot_deliver() {
+        assert!(generate_secret_in_range(24, 16, "").is_err(), "min > max");
+        assert!(generate_secret_in_range(0, 10, "").is_err(), "zero length");
+        // Six specials cannot be guaranteed in four characters.
+        assert!(generate_secret_in_range(4, 4, SAFE_SPECIALS).is_err());
+        assert!(generate_secret_in_range(16, 16, "a b").is_err(), "whitespace");
+    }
+
+    #[test]
+    fn the_safe_specials_are_safe_where_passwords_end_up() {
+        // Each of these breaks a URL, a connection string or a quoted shell word.
+        for bad in ['@', ':', '/', '$', '`', '\\', '"', '\'', '!', '%', '#', '?', '&'] {
+            assert!(!SAFE_SPECIALS.contains(bad), "{bad:?} must not be in the default set");
+        }
+    }
+
+    #[test]
+    fn a_generated_ssh_key_is_a_usable_openssh_pair() {
+        let (private, public) = generate_ssh_key("int@colistor").unwrap();
+        assert!(private.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"), "{private:.40}");
+        assert!(private.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+        assert!(public.starts_with("ssh-ed25519 "), "{public}");
+        assert!(public.trim_end().ends_with("int@colistor"), "comment missing: {public}");
+
+        // The marker list resolve_ssh_key checks before handing a key to ssh.
+        assert!(crate::infra::KEY_MARKERS.iter().any(|m| private.trim_start().starts_with(m)),
+            "a generated key must be one resolve_ssh_key will accept");
+
+        // Two calls must not produce the same key.
+        let (_, other) = generate_ssh_key("int@colistor").unwrap();
+        assert_ne!(public, other);
+    }
+
+    #[test]
+    fn a_generated_ssh_key_survives_the_vault_round_trip() {
+        let (private, _) = generate_ssh_key("round-trip").unwrap();
+        let payload = encrypt("pw", &private).unwrap();
+        assert_eq!(decrypt("pw", &payload).unwrap(), private);
+    }
+
+    #[test]
     fn a_generated_secret_survives_the_round_trip_it_will_actually_take() {
         let secret = generate_secret(32);
         let payload = encrypt("pw", &secret).unwrap();
@@ -302,6 +488,23 @@ impl Vault {
     /// Returns the new item's id, so a caller storing it in a variable records the identity the
     /// vault actually assigned rather than echoing back the name it was given.
     pub fn add(&self, name: &str, type_: &str, description: Option<&str>, plain_text: &str, password: &str) -> Result<String> {
+        self.add_with_metadata(name, type_, description, plain_text, password, None)
+    }
+
+    /// As `add`, with extra unencrypted fields stored beside the item.
+    ///
+    /// Used for the public half of a generated keypair. A public key is not a secret and is far
+    /// more useful readable — it has to be handed to a cloud provider, and needing the vault
+    /// password to read out something that is published by design would be theatre.
+    pub fn add_with_metadata(
+        &self,
+        name: &str,
+        type_: &str,
+        description: Option<&str>,
+        plain_text: &str,
+        password: &str,
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String> {
         let mut items = self.read_items()?;
         if items.iter().any(|i| i.name == name) {
             bail!("Vault item already exists: {name}");
@@ -312,6 +515,11 @@ impl Vault {
         let mut rest = serde_json::Map::new();
         rest.insert("createdAt".into(), serde_json::Value::String(now.clone()));
         rest.insert("updatedAt".into(), serde_json::Value::String(now));
+        if let Some(extra) = metadata {
+            for (k, v) in extra {
+                rest.insert(k, v);
+            }
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
         items.push(VaultItem {

@@ -150,6 +150,21 @@ enum VaultOp {
         /// Characters to generate. 32 alphanumerics is roughly 190 bits.
         #[arg(long, default_value_t = 32, requires = "generate")]
         length: usize,
+        /// Shortest acceptable length; with --max-length the length is drawn from the range.
+        #[arg(long = "min-length", requires = "generate")]
+        min_length: Option<usize>,
+        /// Longest acceptable length.
+        #[arg(long = "max-length", requires = "generate")]
+        max_length: Option<usize>,
+        /// Include special characters that are safe in URLs, connection strings and shells.
+        #[arg(long, requires = "generate", conflicts_with = "charset")]
+        special: bool,
+        /// Exactly which extra characters to allow, when --special is not the set you want.
+        #[arg(long, requires = "generate")]
+        charset: Option<String>,
+        /// Comment to embed in a generated SSH key. Defaults to the item id.
+        #[arg(long, requires = "generate")]
+        comment: Option<String>,
         #[arg(long = "type", default_value = "PASSWORD")]
         type_: String,
         #[arg(long)]
@@ -258,10 +273,15 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Vault { operation } => match operation {
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
-            VaultOp::Add { item_id, data, data_file, stdin, generate, length, type_, description, profile } => {
-                vault_add(&item_id, data.as_deref(), data_file.as_deref(), stdin, generate, length,
-                          &type_, description.as_deref(), &profile)
-            }
+            VaultOp::Add {
+                item_id, data, data_file, stdin, generate, length, min_length, max_length,
+                special, charset, comment, type_, description, profile,
+            } => vault_add(
+                &item_id, data.as_deref(), data_file.as_deref(), stdin,
+                GenerateOptions { generate, length, min_length, max_length, special,
+                                  charset: charset.clone(), comment: comment.clone() },
+                &type_, description.as_deref(), &profile,
+            ),
         },
     }
 }
@@ -465,18 +485,35 @@ fn recipe_install(source: &PathBuf, profile_ref: &str, recursive: bool, force: b
 /// A private key passed as --data sits in the process's argv, where anything else on the machine
 /// can read it out of `ps` for as long as the command runs. A file or stdin costs nothing and
 /// closes that, which matters because the natural first use of this command is storing an SSH key.
+/// Everything the --generate family carries.
+struct GenerateOptions {
+    generate: bool,
+    length: usize,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+    special: bool,
+    charset: Option<String>,
+    comment: Option<String>,
+}
+
+/// The value comes from exactly one of: --data, --data-file, stdin, or --generate.
+///
+/// A private key passed as --data sits in the process's argv, where anything else on the machine
+/// can read it out of `ps` for as long as the command runs. A file, stdin or generation costs
+/// nothing and closes that.
 fn vault_add(
     item_id: &str,
     data: Option<&str>,
     data_file: Option<&std::path::Path>,
     stdin: bool,
-    generate: bool,
-    length: usize,
+    gen: GenerateOptions,
     type_: &str,
     description: Option<&str>,
     profile_ref: &str,
 ) -> Result<()> {
-    let value = match (data, data_file, stdin, generate) {
+    let mut public_key: Option<String> = None;
+
+    let value = match (data, data_file, stdin, gen.generate) {
         (Some(d), _, _, _) => d.to_string(),
         (_, Some(path), _, _) => std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?,
@@ -487,10 +524,30 @@ fn vault_add(
             buf
         }
         (_, _, _, true) => {
-            if length < 16 {
-                anyhow::bail!("--length {length} is too short to generate; 16 is the floor, 32 the default");
+            // The type decides what "generate" means. An SSH_KEY item wants a keypair, not a
+            // random string that happens to be stored under the same name.
+            if type_.eq_ignore_ascii_case("SSH_KEY") {
+                let comment = gen.comment.clone().unwrap_or_else(|| item_id.to_string());
+                let (private, public) = bigbang::vault::generate_ssh_key(&comment)?;
+                public_key = Some(public);
+                private
+            } else {
+                let extra = match (&gen.charset, gen.special) {
+                    (Some(chars), _) => chars.clone(),
+                    (None, true) => bigbang::vault::SAFE_SPECIALS.to_string(),
+                    (None, false) => String::new(),
+                };
+                let (min, max) = match (gen.min_length, gen.max_length) {
+                    (None, None) => (gen.length, gen.length),
+                    (Some(a), None) => (a, a.max(gen.length)),
+                    (None, Some(b)) => (gen.length.min(b), b),
+                    (Some(a), Some(b)) => (a, b),
+                };
+                if min < 16 {
+                    anyhow::bail!("{min} is too short to generate; 16 is the floor, 32 the default");
+                }
+                bigbang::vault::generate_secret_in_range(min, max, &extra)?
             }
-            bigbang::vault::generate_secret(length)
         }
         _ => anyhow::bail!(
             "supply the value with --data, --data-file <path>, --stdin, or --generate"
@@ -502,12 +559,24 @@ fn vault_add(
 
     let vault = open_vault(profile_ref)?;
     let password = vault_password()?;
-    vault.add(item_id, type_, description, &value, &password)?;
+    // The public half of a keypair is not a secret, and is stored unencrypted beside the item so
+    // it can be read back — and handed to a cloud provider — without the vault password at all.
+    let metadata = public_key.as_ref().map(|pk| {
+        let mut m = serde_json::Map::new();
+        m.insert("publicKey".to_string(), serde_json::Value::String(pk.clone()));
+        m
+    });
+    vault.add_with_metadata(item_id, type_, description, &value, &password, metadata)?;
+
     // Deliberately reports the length rather than any part of the value.
     println!("✓ Added vault item: {item_id} ({} bytes, {type_})", value.len());
-    if generate {
+    if gen.generate {
         println!("  generated and stored; it has not been displayed and is not recoverable from this output");
-        println!("  read it back with: bigbang vault get --item-id {item_id} --profile <profile>");
+    }
+    if let Some(pk) = public_key {
+        println!();
+        println!("Public key — not a secret, give this to the provider:");
+        println!("{pk}");
     }
     Ok(())
 }

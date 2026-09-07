@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4"] }
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 # The cached vault password is wiped on drop rather than left in freed memory.
 zeroize = { version = "1", features = ["zeroize_derive"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "alloc", "getrandom"] }
 
 [profile.release]
 lto = true

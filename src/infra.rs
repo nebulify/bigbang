@@ -154,7 +154,8 @@ impl Drop for KeyFile {
     }
 }
 
-const KEY_MARKERS: [&str; 5] = [
+/// The private-key headers ssh will accept. Public so a generator can assert it produces one.
+pub const KEY_MARKERS: [&str; 5] = [
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
