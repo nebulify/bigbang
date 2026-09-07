@@ -206,6 +206,25 @@ pub fn resolve_value(
     vault_root: &str,
     password: &dyn Fn() -> anyhow::Result<String>,
 ) -> Result<String> {
+    resolve_value_in(value, vault_root, None, password)
+}
+
+/// As `resolve_value`, with the profile's own vault identity for the short reference form.
+///
+/// `vault:account/project/name` names a specific vault. `vault:name` means "this profile's vault",
+/// which is what makes a task portable: setup-pgbackrest hardcoded
+/// `vault:colistor/colistor/backup_s3_access_key`, so running it under the int profile looked in a
+/// project int's vault does not have. A task that names an environment is a task that belongs to
+/// one, which defeats the point of having environments at all.
+///
+/// The short form is also what 15 references in update-colistor-credentials already use; the
+/// resolver rejected them, so that recipe could not run at all.
+pub fn resolve_value_in(
+    value: &serde_json::Value,
+    vault_root: &str,
+    profile_vault: Option<(&str, &str)>,
+    password: &dyn Fn() -> anyhow::Result<String>,
+) -> Result<String> {
     let raw = match value {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string().trim_matches('"').to_string(),
@@ -213,19 +232,30 @@ pub fn resolve_value(
 
     if let Some(reference) = raw.strip_prefix("vault:") {
         let parts: Vec<&str> = reference.split('/').collect();
-        if parts.len() < 3 {
-            anyhow::bail!("vault reference must be account/project/id, got '{reference}'");
-        }
+        let (account, project, key) = if parts.len() >= 3 {
+            (parts[0].to_string(), parts[1].to_string(), parts[2..].join("/"))
+        } else if parts.len() == 1 {
+            let Some((account, project)) = profile_vault else {
+                anyhow::bail!(
+                    "'vault:{reference}' is the short form, which resolves against the profile's \
+                     own vault — and this call site has none. Use vault:account/project/name here."
+                );
+            };
+            (account.to_string(), project.to_string(), parts[0].to_string())
+        } else {
+            anyhow::bail!(
+                "vault reference must be 'name' or 'account/project/name', got '{reference}'"
+            );
+        };
         let pw = password()?;
         let vault = crate::vault::Vault::new(
             crate::profile::Profile::expand(vault_root),
-            parts[0],
-            parts[1],
+            &account,
+            &project,
         );
-        let key = parts[2..].join("/");
         return vault
             .get(&key, &pw)?
-            .with_context(|| format!("Vault item not found: {key} in {}/{}", parts[0], parts[1]));
+            .with_context(|| format!("Vault item not found: {key} in {account}/{project}"));
     }
 
     if let Some(name) = raw.strip_prefix("env:") {
@@ -287,6 +317,16 @@ pub fn resolve_all(
     password: &dyn Fn() -> anyhow::Result<String>,
     overrides: &BTreeMap<String, String>,
 ) -> Result<Resolved> {
+    resolve_all_in(variables, vault_root, None, password, overrides)
+}
+
+pub fn resolve_all_in(
+    variables: &BTreeMap<String, serde_json::Value>,
+    vault_root: &str,
+    profile_vault: Option<(&str, &str)>,
+    password: &dyn Fn() -> anyhow::Result<String>,
+    overrides: &BTreeMap<String, String>,
+) -> Result<Resolved> {
     let mut out = Resolved::default();
     for (key, value) in variables {
         if let Some(supplied) = overrides.get(key) {
@@ -304,7 +344,7 @@ pub fn resolve_all(
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let resolved = resolve_value(value, vault_root, password)
+        let resolved = resolve_value_in(value, vault_root, profile_vault, password)
             .with_context(|| format!("resolving variable '{key}'"))?;
         if declared.starts_with("vault:") || declared.starts_with("env:") {
             out.secrets.push(resolved.clone());
@@ -331,6 +371,33 @@ mod value_tests {
 
     fn no_password() -> anyhow::Result<String> {
         anyhow::bail!("should not be asked")
+    }
+
+    /// `vault:name` means "this profile's vault". Without it a task must name an account and
+    /// project, which ties it to one environment — setup-pgbackrest said
+    /// `vault:colistor/colistor/...` and so could only ever run against production.
+    #[test]
+    fn the_short_vault_form_needs_a_profile_to_resolve_against() {
+        let value = serde_json::Value::String("vault:backup_s3_access_key".into());
+        let err = resolve_value(&value, "/nonexistent", &no_password).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("short form"), "{text}");
+
+        // Given one, it looks in that profile's vault rather than a hardcoded pair.
+        let err = resolve_value_in(&value, "/nonexistent", Some(("colistor", "colistor-int")), &no_password)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("short form"),
+            "with a profile it should attempt a lookup, not refuse: {text}"
+        );
+    }
+
+    #[test]
+    fn a_two_part_reference_is_still_refused() {
+        let value = serde_json::Value::String("vault:colistor/backup_key".into());
+        let err = resolve_value_in(&value, "/nonexistent", Some(("a", "b")), &no_password).unwrap_err();
+        assert!(format!("{err:#}").contains("must be"), "{err:#}");
     }
 
     /// `--var` must be able to introduce a variable, not only replace a declared one. Removing a

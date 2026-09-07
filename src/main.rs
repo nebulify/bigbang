@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 
 use bigbang::profile::Profile;
 use bigbang::recipe;
+use bigbang::recipe::resolve_all_in;
 use bigbang::repodb::{RepoDb, TYPE_RECIPE};
 use bigbang::vault::Vault;
 use bigbang::EXIT_FAILURE;
@@ -971,7 +972,8 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
 
     let vault_root = Profile::expand(&profile.vault_path);
     let password = || vault_password_for(profile_ref);
-    let resolved = resolve_all(&recipe.variables, &vault_root, &password, &overrides)?;
+    let profile_vault = Some((profile.account_code.as_str(), profile.default_vault_name.as_str()));
+    let resolved = resolve_all_in(&recipe.variables, &vault_root, profile_vault, &password, &overrides)?;
     let recipe_vars = resolved.values;
     let mut secret_values = resolved.secrets;
     let instances = load_instances(&store)?;
@@ -994,7 +996,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
             continue;
         }
 
-        let role_resolved = resolve_all(&role.variables, &vault_root, &password, &overrides)?;
+        let role_resolved = resolve_all_in(&role.variables, &vault_root, profile_vault, &password, &overrides)?;
         secret_values.extend(role_resolved.secrets.clone());
         let mut merged = recipe_vars.clone();
         merged.extend(role_resolved.values);
@@ -1039,6 +1041,26 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     _key_guard = key; // keep the temporary key file alive for the whole run
                     Box::new(SshExecutor { target, echo: true, secrets })
                 };
+
+                // A task's own variables may hold `vault:` references too, and until now nothing
+                // resolved them: only recipe and role variables went through resolve_all, so
+                // setup-pgbackrest wrote the literal text `vault:backup_s3_access_key` into
+                // pgbackrest.conf. Resolved here, at lower precedence than the recipe's, which is
+                // the order run_definition already applies.
+                let task_resolved = resolve_all_in(
+                    &definition
+                        .variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect(),
+                    &vault_root,
+                    profile_vault,
+                    &password,
+                    &overrides,
+                )?;
+                secret_values.extend(task_resolved.secrets.clone());
+                let mut definition = definition.clone();
+                definition.variables = task_resolved.values;
 
                 // Functions need more than a shell: where templates live, and a vault to write to.
                 let function_vault = open_vault(profile_ref).ok();
