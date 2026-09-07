@@ -188,7 +188,11 @@ pub fn resolve_ssh_key(
     let key_id = parts[2..].join("/");
 
     let vault = Vault::new(crate::profile::Profile::expand(vault_root), account, project);
-    let items = vault.read_items()?;
+    // A `vault:` reference has already committed to needing the password, so asking for it here
+    // costs nothing that was not already owed — and a v2 vault cannot be enumerated without it.
+    // The closure is still what defers the question, so a `file:` key never reaches this line.
+    let pw = password()?;
+    let items = vault.read_items_with(Some(&pw))?;
     // The reference may name either the item's id or its name; the Kotlin resolver looks by id.
     let item = items
         .iter()
@@ -197,7 +201,6 @@ pub fn resolve_ssh_key(
 
     let payload: vault::EncryptedPayload = serde_json::from_str(&item.encrypted_content)
         .context("parsing the encrypted key payload")?;
-    let pw = password()?;
     let key = vault::decrypt(&pw, &payload).context("decrypting the SSH key")?;
 
     // Refuse early rather than handing ssh something that is not a key: the error it gives back is

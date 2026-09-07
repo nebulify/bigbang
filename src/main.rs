@@ -451,7 +451,7 @@ fn vault_list(profile_ref: &str) -> Result<()> {
             let password = vault_password_for(profile_ref)?;
             vault.read_items_with(Some(&password))?
         }
-        _ => vault.read_items()?,
+        _ => vault.read_items_with(None)?,
     };
     if items.is_empty() {
         println!("No vault items found");

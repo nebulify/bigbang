@@ -351,10 +351,6 @@ impl Vault {
         serde_json::from_str(&raw).context("parsing the vault items")
     }
 
-    pub fn read_items(&self) -> Result<Vec<VaultItem>> {
-        self.read_items_with(None)
-    }
-
 
     pub fn get(&self, item_name: &str, password: &str) -> Result<Option<String>> {
         let items = self.read_items_with(Some(password))?;
@@ -366,8 +362,15 @@ impl Vault {
         Ok(Some(decrypt(password, &payload)?))
     }
 
+    /// Names and types, for a v1 vault only.
+    ///
+    /// v2 keeps names inside the envelope, so there is nothing to list without the password. The
+    /// method is deliberately not a convenience wrapper over a password-less read: that wrapper
+    /// existed, and four call sites used it against v2 vaults where it could only ever fail —
+    /// `vault unlock`, `vault get`, `vault add` and the SSH key resolver. Removing it turned each
+    /// of those from a runtime message into a compile error.
     pub fn list(&self) -> Result<Vec<(String, String)>> {
-        Ok(self.read_items()?.into_iter().map(|i| (i.name, i.type_)).collect())
+        Ok(self.read_items_with(None)?.into_iter().map(|i| (i.name, i.type_)).collect())
     }
 
     pub fn path_of(root: &Path, account: &str, project: &str) -> PathBuf {
