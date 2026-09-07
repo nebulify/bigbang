@@ -64,10 +64,22 @@ pub struct AgentRequest {
     /// When set, `argv` and `env` are ignored: the structure comes from the vault instead.
     #[serde(default)]
     pub run_prepared: Option<RunPrepared>,
+    /// Ask the agent for the vault password, so `bigbang` can resolve its own `vault:` references
+    /// without prompting for every recipe run.
+    ///
+    /// This hands the password to the caller, which the rest of the protocol exists to avoid — but
+    /// the caller here is bigbang resolving a reference it would otherwise have prompted for, and
+    /// refusing would mean the agent helps with everything except deployments, which is the reason
+    /// it exists. It is a separate field so the audit log records exactly when it happened.
+    #[serde(default)]
+    pub request_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
+    /// Only set in reply to `request_password`.
+    #[serde(default)]
+    pub password: Option<String>,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -170,7 +182,7 @@ pub fn redact(text: &str, values: &[String]) -> String {
 }
 
 fn refuse(message: String) -> AgentResponse {
-    AgentResponse { exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(message) }
+    AgentResponse { password: None, exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(message) }
 }
 
 /// Only unrestricted items may be substituted into a command the caller composed.
@@ -186,7 +198,20 @@ fn substitutable(items: &BTreeMap<String, UnlockedItem>) -> BTreeMap<String, Str
 }
 
 /// Run one request: substitute, exec, redact.
-pub fn handle(request: &AgentRequest, items: &BTreeMap<String, UnlockedItem>) -> AgentResponse {
+pub fn handle(
+    request: &AgentRequest,
+    items: &BTreeMap<String, UnlockedItem>,
+    password: &str,
+) -> AgentResponse {
+    if request.request_password {
+        return AgentResponse {
+            password: Some(password.to_string()),
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        };
+    }
     if let Some(invocation) = &request.run_prepared {
         return run_prepared(invocation, items);
     }
@@ -224,11 +249,11 @@ pub fn handle(request: &AgentRequest, items: &BTreeMap<String, UnlockedItem>) ->
     let argv = match argv {
         Ok(a) => a,
         Err(err) => {
-            return AgentResponse { exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(format!("{err:#}")) }
+            return AgentResponse { password: None, exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(format!("{err:#}")) }
         }
     };
     if argv.is_empty() {
-        return AgentResponse { exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some("no command given".into()) };
+        return AgentResponse { password: None, exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some("no command given".into()) };
     }
 
     let mut env = BTreeMap::new();
@@ -238,7 +263,7 @@ pub fn handle(request: &AgentRequest, items: &BTreeMap<String, UnlockedItem>) ->
                 env.insert(key.clone(), v);
             }
             Err(err) => {
-                return AgentResponse { exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(format!("{err:#}")) }
+                return AgentResponse { password: None, exit_code: 1, stdout: String::new(), stderr: String::new(), error: Some(format!("{err:#}")) }
             }
         }
     }
@@ -256,12 +281,14 @@ pub fn handle(request: &AgentRequest, items: &BTreeMap<String, UnlockedItem>) ->
 
     match command.output() {
         Ok(out) => AgentResponse {
+            password: None,
             exit_code: out.status.code().unwrap_or(-1),
             stdout: redact(&String::from_utf8_lossy(&out.stdout), &used),
             stderr: redact(&String::from_utf8_lossy(&out.stderr), &used),
             error: None,
         },
         Err(err) => AgentResponse {
+            password: None,
             exit_code: 127,
             stdout: String::new(),
             stderr: String::new(),
@@ -362,13 +389,14 @@ fn run_prepared(
     } else {
         (String::new(), String::new())
     };
-    AgentResponse { exit_code: out.status.code().unwrap_or(-1), stdout, stderr, error: None }
+    AgentResponse { password: None, exit_code: out.status.code().unwrap_or(-1), stdout, stderr, error: None }
 }
 
 /// Listen until the deadline passes or the socket is removed.
 pub fn serve(
     path: &Path,
     items: BTreeMap<String, UnlockedItem>,
+    password: String,
     ttl: Duration,
     audit: Option<PathBuf>,
 ) -> Result<()> {
@@ -399,7 +427,7 @@ pub fn serve(
                 // Back to blocking for the conversation itself; the non-blocking mode exists only
                 // so that waiting for a connection can also watch the clock.
                 stream.set_nonblocking(false)?;
-                serve_one(stream, &items, audit.as_deref());
+                serve_one(stream, &items, &password, audit.as_deref());
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if SystemTime::now() >= deadline {
@@ -417,7 +445,7 @@ pub fn serve(
     }
 }
 
-fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, audit: Option<&Path>) {
+fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, password: &str, audit: Option<&Path>) {
     let Ok(clone) = stream.try_clone() else { return };
     let mut reader = BufReader::new(clone);
     let mut line = String::new();
@@ -429,9 +457,10 @@ fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, aud
             if let Some(log) = audit {
                 append_audit(log, &request);
             }
-            handle(&request, items)
+            handle(&request, items, password)
         }
         Err(err) => AgentResponse {
+            password: None,
             exit_code: 1,
             stdout: String::new(),
             stderr: String::new(),
@@ -447,11 +476,17 @@ fn serve_one(mut stream: UnixStream, items: &BTreeMap<String, UnlockedItem>, aud
 fn append_audit(path: &Path, request: &AgentRequest) {
     use std::fs::OpenOptions;
     let when = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-    let line = format!(
-        "{when} argv={:?} env_keys={:?}\n",
-        request.argv,
-        request.env.keys().collect::<Vec<_>>()
-    );
+    let line = if request.request_password {
+        format!("{when} REQUEST_PASSWORD (bigbang resolving its own vault: references)\n")
+    } else if let Some(run) = &request.run_prepared {
+        format!("{when} run {}/{} params={:?}\n", run.item, run.command, run.params.keys().collect::<Vec<_>>())
+    } else {
+        format!(
+            "{when} argv={:?} env_keys={:?}\n",
+            request.argv,
+            request.env.keys().collect::<Vec<_>>()
+        )
+    };
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
@@ -553,8 +588,8 @@ mod tests {
 
         // Arrives whole: a shell would have split on ';' and run `c` as a command substitution.
         let response = handle(
-            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None },
-            &m,
+            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None, request_password: false },
+            &m, "pw",
         );
         assert_eq!(response.exit_code, 0);
         assert_eq!(response.stdout.trim_end(), "a;b`c", "value did not survive intact");
@@ -564,9 +599,9 @@ mod tests {
             &AgentRequest {
                 argv: vec!["sh".into(), "-c".into(), "echo $#".into(), "_".into(), "{{v}}".into()],
                 env: BTreeMap::new(),
-                cwd: None, run_prepared: None,
+                cwd: None, run_prepared: None, request_password: false,
             },
-            &m,
+            &m, "pw",
         );
         assert_eq!(counted.stdout.trim_end(), "1", "the value should be a single argument");
     }
@@ -577,8 +612,8 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("v".to_string(), plain("a; rm -rf / --long-enough"));
         let response = handle(
-            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None },
-            &m,
+            &AgentRequest { argv: vec!["echo".into(), "{{v}}".into()], env: BTreeMap::new(), cwd: None, run_prepared: None, request_password: false },
+            &m, "pw",
         );
         assert!(!response.stdout.contains("rm -rf"), "leaked: {}", response.stdout);
         assert!(response.stdout.contains("«redacted»"), "{}", response.stdout);
@@ -589,9 +624,9 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "echo {{db_password}}".into()],
             env: BTreeMap::new(),
-            cwd: None, run_prepared: None,
+            cwd: None, run_prepared: None, request_password: false,
         };
-        let response = handle(&request, &items());
+        let response = handle(&request, &items(), "pw");
         assert!(!response.stdout.contains("s3cr3t-value-long"), "leaked: {}", response.stdout);
         assert!(response.stdout.contains("«redacted»"), "{}", response.stdout);
     }
@@ -603,9 +638,9 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "test -n \"$SECRET\" && echo present".into()],
             env,
-            cwd: None, run_prepared: None,
+            cwd: None, run_prepared: None, request_password: false,
         };
-        let response = handle(&request, &items());
+        let response = handle(&request, &items(), "pw");
         assert_eq!(response.exit_code, 0);
         assert!(response.stdout.contains("present"), "{}", response.stdout);
         // The command itself carries no trace of the value.
@@ -617,9 +652,9 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["sh".into(), "-c".into(), "exit 7".into()],
             env: BTreeMap::new(),
-            cwd: None, run_prepared: None,
+            cwd: None, run_prepared: None, request_password: false,
         };
-        assert_eq!(handle(&request, &items()).exit_code, 7);
+        assert_eq!(handle(&request, &items(), "pw").exit_code, 7);
     }
 
     #[test]
@@ -627,9 +662,9 @@ mod tests {
         let request = AgentRequest {
             argv: vec!["definitely-not-a-real-binary-xyz".into()],
             env: BTreeMap::new(),
-            cwd: None, run_prepared: None,
+            cwd: None, run_prepared: None, request_password: false,
         };
-        let response = handle(&request, &items());
+        let response = handle(&request, &items(), "pw");
         assert_ne!(response.exit_code, 0);
         assert!(response.error.is_some());
     }
@@ -641,9 +676,9 @@ mod tests {
         let response = handle(
             &AgentRequest {
                 argv: vec!["echo".into(), "{{registry_token}}".into()],
-                env: BTreeMap::new(), cwd: None, run_prepared: None,
+                env: BTreeMap::new(), cwd: None, run_prepared: None, request_password: false,
             },
-            &restricted(),
+            &restricted(), "pw",
         );
         let error = response.error.expect("a restricted item must not substitute");
         assert!(error.contains("restricted"), "{error}");
@@ -655,8 +690,8 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("T".to_string(), "{{registry_token}}".to_string());
         let response = handle(
-            &AgentRequest { argv: vec!["true".into()], env, cwd: None, run_prepared: None },
-            &restricted(),
+            &AgentRequest { argv: vec!["true".into()], env, cwd: None, run_prepared: None, request_password: false },
+            &restricted(), "pw",
         );
         assert!(response.error.is_some(), "env injection must be refused too");
     }
@@ -665,14 +700,14 @@ mod tests {
     fn a_prepared_command_can_use_the_value_it_guards() {
         let response = handle(
             &AgentRequest {
-                argv: vec![], env: BTreeMap::new(), cwd: None,
+                argv: vec![], env: BTreeMap::new(), cwd: None, request_password: false,
                 run_prepared: Some(RunPrepared {
                     item: "registry_token".into(),
                     command: "show-length".into(),
                     params: BTreeMap::new(),
                 }),
             },
-            &restricted(),
+            &restricted(), "pw",
         );
         assert_eq!(response.exit_code, 0, "{:?}", response.error);
         // wc -c over the secret: it reached the child, and only its length came back.
@@ -686,14 +721,14 @@ mod tests {
         params.insert("sneaky".to_string(), "value".to_string());
         let response = handle(
             &AgentRequest {
-                argv: vec![], env: BTreeMap::new(), cwd: None,
+                argv: vec![], env: BTreeMap::new(), cwd: None, request_password: false,
                 run_prepared: Some(RunPrepared {
                     item: "registry_token".into(),
                     command: "show-length".into(),
                     params,
                 }),
             },
-            &restricted(),
+            &restricted(), "pw",
         );
         let error = response.error.expect("undeclared parameters must be refused");
         assert!(error.contains("sneaky"), "{error}");
@@ -725,12 +760,12 @@ mod tests {
         params.insert("text".to_string(), "{{db_password}} {{self}}".to_string());
         let response = handle(
             &AgentRequest {
-                argv: vec![], env: BTreeMap::new(), cwd: None,
+                argv: vec![], env: BTreeMap::new(), cwd: None, request_password: false,
                 run_prepared: Some(RunPrepared {
                     item: "echoer".into(), command: "say".into(), params,
                 }),
             },
-            &m,
+            &m, "pw",
         );
         assert_eq!(response.exit_code, 0, "{:?}", response.error);
         assert!(!response.stdout.contains("s3cr3t-value-long"), "reached another secret: {}", response.stdout);
@@ -742,15 +777,40 @@ mod tests {
     fn an_unknown_prepared_command_lists_what_exists() {
         let response = handle(
             &AgentRequest {
-                argv: vec![], env: BTreeMap::new(), cwd: None,
+                argv: vec![], env: BTreeMap::new(), cwd: None, request_password: false,
                 run_prepared: Some(RunPrepared {
                     item: "registry_token".into(), command: "nope".into(), params: BTreeMap::new(),
                 }),
             },
-            &restricted(),
+            &restricted(), "pw",
         );
         let error = response.error.unwrap();
         assert!(error.contains("show-length"), "{error}");
+    }
+
+    /// The one place the agent hands back a secret on purpose: bigbang resolving its own vault:
+    /// references, which would otherwise prompt for every recipe run.
+    #[test]
+    fn the_agent_returns_the_vault_password_only_when_asked_for_it() {
+        let asked = handle(
+            &AgentRequest {
+                argv: vec![], env: BTreeMap::new(), cwd: None,
+                run_prepared: None, request_password: true,
+            },
+            &items(), "the-vault-password",
+        );
+        assert_eq!(asked.password.as_deref(), Some("the-vault-password"));
+        assert_eq!(asked.exit_code, 0);
+
+        // Every other request must leave it absent, so it cannot arrive by accident.
+        let ordinary = handle(
+            &AgentRequest {
+                argv: vec!["true".into()], env: BTreeMap::new(), cwd: None,
+                run_prepared: None, request_password: false,
+            },
+            &items(), "the-vault-password",
+        );
+        assert!(ordinary.password.is_none(), "a password came back unasked");
     }
 
     #[test]
@@ -762,7 +822,7 @@ mod tests {
 
         let serve_path = path.clone();
         let handle_thread = std::thread::spawn(move || {
-            let _ = serve(&serve_path, items(), Duration::from_secs(20), None);
+            let _ = serve(&serve_path, items(), "pw".into(), Duration::from_secs(20), None);
         });
         // Wait for the socket rather than sleeping a guessed interval.
         for _ in 0..100 {
@@ -778,7 +838,7 @@ mod tests {
             &AgentRequest {
                 argv: vec!["sh".into(), "-c".into(), "echo {{token}}".into()],
                 env: BTreeMap::new(),
-                cwd: None, run_prepared: None,
+                cwd: None, run_prepared: None, request_password: false,
             },
         )
         .unwrap();
@@ -800,7 +860,7 @@ mod tests {
 
         let serve_path = path.clone();
         std::thread::spawn(move || {
-            let _ = serve(&serve_path, BTreeMap::new(), Duration::from_secs(10), None);
+            let _ = serve(&serve_path, BTreeMap::new(), "pw".into(), Duration::from_secs(10), None);
         });
         for _ in 0..100 {
             if is_running(&path) {

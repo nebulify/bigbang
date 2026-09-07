@@ -128,6 +128,7 @@ fn run() -> Result<u8> {
             env,
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
             run_prepared: run.map(|(item, command)| agent::RunPrepared { item, command, params }),
+            request_password: false,
         },
     )?;
 

@@ -350,6 +350,13 @@ fn open_vault(profile_ref: &str) -> Result<Vault> {
 
 /// Same variables the Kotlin CLI honours, in the same order, so a pipeline that sets one keeps
 /// working across the migration. Refuses rather than prompting with no terminal.
+/// The vault password: from the environment, otherwise from the terminal.
+///
+/// Read from `/dev/tty` with echo disabled, not from stdin, for two reasons that both bit in
+/// practice. Reading stdin meant `printf '%s' secret | bigbang vault add --stdin` could not work at
+/// all — the value had consumed stdin, so the prompt found nothing and the command refused. And a
+/// line read from stdin is echoed, so the password appeared on screen and stayed in the scrollback
+/// of whoever typed it.
 fn vault_password() -> Result<String> {
     for var in ["COLISTOR_MASTER_PASSWORD", "BIGBANG_VAULT_PASSWORD", "VAULT_PASSWORD"] {
         if let Ok(value) = std::env::var(var) {
@@ -358,17 +365,80 @@ fn vault_password() -> Result<String> {
             }
         }
     }
-    if !bigbang::recipe::interactive() {
-        eprintln!("❌ Needs input, and this session cannot ask: Vault password");
-        eprintln!("   Set BIGBANG_VAULT_PASSWORD (or COLISTOR_MASTER_PASSWORD).");
-        std::process::exit(bigbang::EXIT_NEEDS_INPUT as i32);
+    match rpassword::prompt_password("Vault password: ") {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            // No terminal to ask on. Distinct from a failure, so a pipeline can tell "nobody could
+            // answer" from "the thing went wrong".
+            eprintln!("❌ Needs input, and this session cannot ask: Vault password");
+            eprintln!("   Set BIGBANG_VAULT_PASSWORD, or run this where there is a terminal.");
+            std::process::exit(bigbang::EXIT_NEEDS_INPUT as i32);
+        }
     }
-    print!("Vault password: ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// The vault password, asking a running agent before asking the person.
+///
+/// This is what makes unlocking worth anything for deployments: without it `recipe execute` would
+/// prompt for every run while an unlocked agent sat there, and the agent would be useful for
+/// everything except the tool it ships with.
+fn vault_password_for(profile_ref: &str) -> Result<String> {
+    for var in ["COLISTOR_MASTER_PASSWORD", "BIGBANG_VAULT_PASSWORD", "VAULT_PASSWORD"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    if let Ok(profile) = Profile::open(profile_ref) {
+        let socket = bigbang::agent::socket_path(&profile.name);
+        if bigbang::agent::is_running(&socket) {
+            let request = bigbang::agent::AgentRequest {
+                argv: vec![],
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                run_prepared: None,
+                request_password: true,
+            };
+            if let Ok(response) = bigbang::agent::send(&socket, &request) {
+                if let Some(password) = response.password {
+                    return Ok(password);
+                }
+            }
+        }
+    }
+    vault_password()
+}
+
+/// The password for a vault that does not exist yet, asked twice.
+///
+/// The first write establishes the password, because it is what derives the key. There is nothing
+/// to check a typo against — the vault would simply be encrypted under a password nobody knows, and
+/// that is discovered later, by which time it holds something.
+fn new_vault_password() -> Result<String> {
+    for var in ["COLISTOR_MASTER_PASSWORD", "BIGBANG_VAULT_PASSWORD", "VAULT_PASSWORD"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    println!("This vault does not exist yet: the password you choose now is the password.");
+    let first = match rpassword::prompt_password("Choose a vault password: ") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("❌ Needs input, and this session cannot ask: Vault password");
+            std::process::exit(bigbang::EXIT_NEEDS_INPUT as i32);
+        }
+    };
+    if first.trim().is_empty() {
+        anyhow::bail!("an empty vault password is not accepted");
+    }
+    let again = rpassword::prompt_password("Type it again: ").unwrap_or_default();
+    if first != again {
+        anyhow::bail!("the two entries differ; nothing was written");
+    }
+    Ok(first)
 }
 
 fn vault_list(profile_ref: &str) -> Result<()> {
@@ -378,7 +448,7 @@ fn vault_list(profile_ref: &str) -> Result<()> {
     // which is not an inconvenience to route around — it is the property being paid for.
     let items = match vault.format()? {
         Format::V2 => {
-            let password = vault_password()?;
+            let password = vault_password_for(profile_ref)?;
             vault.read_items_with(Some(&password))?
         }
         _ => vault.read_items()?,
@@ -623,7 +693,7 @@ fn vault_unlock(
     println!("   use it with: bb -- <command with {{{{item-name}}}}>");
 
     if foreground {
-        return agent::serve(&socket, items, std::time::Duration::from_secs(ttl_secs), audit);
+        return agent::serve(&socket, items, password, std::time::Duration::from_secs(ttl_secs), audit);
     }
 
     // Detach by re-executing ourselves in the foreground with the password in the child's
@@ -838,7 +908,11 @@ fn vault_add(
     }
 
     let vault = open_vault(profile_ref)?;
-    let password = vault_password()?;
+    let password = if vault.format()? == bigbang::vault::Format::New {
+        new_vault_password()?
+    } else {
+        vault_password()?
+    };
     // The public half of a keypair is not a secret, and is stored unencrypted beside the item so
     // it can be read back — and handed to a cloud provider — without the vault password at all.
     let mut meta = serde_json::Map::new();
@@ -909,7 +983,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
     }
 
     let vault_root = Profile::expand(&profile.vault_path);
-    let password = || vault_password();
+    let password = || vault_password_for(profile_ref);
     let resolved = resolve_all(&recipe.variables, &vault_root, &password, &overrides)?;
     let recipe_vars = resolved.values;
     let mut secret_values = resolved.secrets;
