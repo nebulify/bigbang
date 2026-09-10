@@ -1320,12 +1320,46 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
         }
     }
 
+    // Every package a role runs declares what a host must have — memory, disk, OS —
+    // and until now nothing read it. Those requirements become prerequisites here, so
+    // the component that needs the memory is the one that says so and a recipe
+    // composed of three packages inherits all three sets without copying anything.
+    let mut package_checks: Vec<bigbang::recipe::Prerequisite> = Vec::new();
+    for (_, targets) in &plan {
+        if targets.is_empty() {
+            continue;
+        }
+        for role in recipe.roles.iter() {
+            for item in &role.items {
+                let Some(coordinate) = item.package.as_deref() else { continue };
+                let Some((name, req)) =
+                    bigbang::task::PackageDefinition::requirements_of(&library_root, coordinate)
+                else {
+                    continue;
+                };
+                for (check, command, why) in req.checks(&name) {
+                    if package_checks.iter().any(|p| p.check == check) {
+                        continue;
+                    }
+                    package_checks.push(bigbang::recipe::Prerequisite {
+                        check,
+                        command,
+                        failure_message: Some(why),
+                    });
+                }
+            }
+        }
+        break;
+    }
+    let all_prerequisites: Vec<&bigbang::recipe::Prerequisite> =
+        recipe.prerequisites.iter().chain(package_checks.iter()).collect();
+
     // Prerequisites are checked on every machine the recipe targets, before any
     // of them is touched. Checking them per host as its turn came would mean
     // the first host is already changed when the second fails its check, which
     // is the half-deployed state the checks exist to avoid.
     let sessions = Sessions::new(recipe.single_session);
-    if dry_run && !recipe.prerequisites.is_empty() {
+    if dry_run && !all_prerequisites.is_empty() {
         // A prerequisite is an arbitrary command from the recipe. Running it
         // would make --dry-run something that executes, which is the one thing
         // it promises not to be. Say they were skipped rather than let a clean
@@ -1333,13 +1367,13 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
         println!();
         println!(
             "Prerequisites: {} not checked — a dry run does not execute them",
-            recipe.prerequisites.len()
+            all_prerequisites.len()
         );
-        for p in &recipe.prerequisites {
+        for p in &all_prerequisites {
             println!("  ⊘ {}", p.check);
         }
     }
-    if !recipe.prerequisites.is_empty() && complaints.is_empty() && !dry_run {
+    if !all_prerequisites.is_empty() && complaints.is_empty() && !dry_run {
         let mut seen: Vec<String> = Vec::new();
         println!();
         println!("Prerequisites:");
@@ -1372,7 +1406,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     _key_guard = key;
                     Box::new(ex)
                 };
-                for p in &recipe.prerequisites {
+                for p in &all_prerequisites {
                     let result = probe.run(&p.command, 60)?;
                     let ok = result.exit_code == 0;
                     println!(

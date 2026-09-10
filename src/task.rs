@@ -303,6 +303,70 @@ pub struct PackageDefinition {
     pub selectors: Vec<String>,
     #[serde(default)]
     pub tasks: Vec<PackageRef>,
+    /// What a host must have for this package to work.
+    ///
+    /// Declared in every package in this repository since they were written, and read by
+    /// nothing until now: `postgres-vps-setup` asks for 2048 MB and 20 GB on Debian or
+    /// Ubuntu, and the deployment would proceed on a 512 MB Alpine box and fail somewhere
+    /// inside apt. A requirement nobody checks reads as a guarantee.
+    #[serde(rename = "minRequirements", default)]
+    pub min_requirements: Option<MinRequirements>,
+}
+
+/// A package's host requirements, turned into prerequisites at run time.
+///
+/// The point of keeping them here rather than repeating them in every recipe: the
+/// component that needs the memory is the component that should say so, and a recipe
+/// composed of three packages then inherits all three sets without copying anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MinRequirements {
+    #[serde(rename = "minMemoryMb", default)]
+    pub min_memory_mb: Option<u64>,
+    #[serde(rename = "minDiskGb", default)]
+    pub min_disk_gb: Option<u64>,
+    #[serde(rename = "supportedOsSystems", default)]
+    pub supported_os: Vec<String>,
+}
+
+impl MinRequirements {
+    /// The shell checks these requirements amount to, as `(what, command, why)`.
+    ///
+    /// Debian-family commands, because that is what `supportedOsSystems` admits and what
+    /// every task in this library installs with. A check that cannot run on the host it is
+    /// checking would be worse than none.
+    pub fn checks(&self, package: &str) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        if let Some(mb) = self.min_memory_mb {
+            out.push((
+                format!("{mb} MB of memory, for {package}"),
+                format!("[ \"$(free -m | awk '/^Mem:/{{print $2}}')\" -ge {mb} ]"),
+                format!("{package} needs at least {mb} MB of memory"),
+            ));
+        }
+        if let Some(gb) = self.min_disk_gb {
+            out.push((
+                format!("{gb} GB free on /, for {package}"),
+                format!(
+                    "[ \"$(df -BG --output=avail / | tail -1 | tr -dc '0-9')\" -ge {gb} ]"
+                ),
+                format!("{package} needs at least {gb} GB free on /"),
+            ));
+        }
+        if !self.supported_os.is_empty() {
+            // Matched against ID and ID_LIKE, so Ubuntu satisfies a package that says
+            // "debian" — which is what every apt-based task in this library means by it.
+            let pattern = self.supported_os.join("|");
+            out.push((
+                format!("a supported OS ({}), for {package}", self.supported_os.join(", ")),
+                format!("grep -qE '^ID(_LIKE)?=.*({pattern})' /etc/os-release"),
+                format!(
+                    "{package} supports {} and this host is none of them",
+                    self.supported_os.join(" or ")
+                ),
+            ));
+        }
+        out
+    }
 }
 
 /// Both forms occur in this repository: some packages list bare coordinate strings, others list
@@ -341,6 +405,26 @@ impl PackageRef {
 }
 
 impl PackageDefinition {
+    /// The host requirements a coordinate declares, when it is a package.
+    ///
+    /// `None` for a task: a task is one step and the package it belongs to is where the
+    /// shape of the host is declared. Looked up without expanding, so asking what a
+    /// deployment needs does not mean loading every command it would run.
+    pub fn requirements_of(
+        library_root: &Path,
+        coordinate: &str,
+    ) -> Option<(String, MinRequirements)> {
+        let parts: Vec<&str> = coordinate.split('/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let dir = library_root.join(parts[0]).join(parts[1]).join(parts[2]);
+        let package = PackageDefinition::load_file(&dir.join("package.json")).ok()?;
+        package
+            .min_requirements
+            .map(|req| (package.name.clone(), req))
+    }
+
     pub fn load_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
@@ -683,6 +767,72 @@ mod tests {
         assert!(err.contains("package cycle"), "expected a cycle diagnosis, got: {err}");
         // The chain has to name the path taken, or the message cannot be acted on.
         assert!(err.contains("g/a/1.0") && err.contains("g/b/1.0"), "got: {err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_packages_declared_requirements_become_checks_naming_the_package() {
+        // These were declared in every package in this repository and read by nothing.
+        // postgres-vps-setup asks for 2048 MB, 20 GB and a Debian-family OS; the
+        // deployment would have proceeded on a 512 MB Alpine box and failed inside apt.
+        let req = MinRequirements {
+            min_memory_mb: Some(2048),
+            min_disk_gb: Some(20),
+            supported_os: vec!["debian".into(), "ubuntu".into()],
+        };
+        let checks = req.checks("postgres-vps-setup");
+        assert_eq!(checks.len(), 3);
+        for (what, command, why) in &checks {
+            // The package is named in both, because a recipe composed of three packages
+            // must say which one is asking rather than leaving you to guess.
+            assert!(what.contains("postgres-vps-setup"), "{what}");
+            assert!(why.contains("postgres-vps-setup"), "{why}");
+            assert!(!command.is_empty());
+        }
+        assert!(checks[0].1.contains("free -m"));
+        assert!(checks[1].1.contains("df -BG"));
+        // ID_LIKE as well as ID, so Ubuntu satisfies a package that says "debian" —
+        // which is what every apt-based task in this library means by it.
+        assert!(checks[2].1.contains("ID(_LIKE)?"), "{}", checks[2].1);
+        assert!(checks[2].1.contains("debian|ubuntu"), "{}", checks[2].1);
+    }
+
+    #[test]
+    fn a_package_declaring_nothing_adds_no_checks() {
+        // Most packages will not declare requirements, and inventing some for them
+        // would make every deployment fail on a box that was fine.
+        assert!(MinRequirements::default().checks("anything").is_empty());
+    }
+
+    #[test]
+    fn requirements_are_read_from_a_package_and_not_from_a_task() {
+        // A task is one step; the package it belongs to is where the shape of the host
+        // is declared. Asking a task would silently find nothing and check nothing.
+        let root = std::env::temp_dir().join(format!("bb-req-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let pkg = root.join("infra/db-stack/1.0");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"type":"blaster:package","group":"infra","name":"db-stack","version":"1.0",
+                "minRequirements":{"minMemoryMb":1024,"supportedOsSystems":["debian"]},
+                "tasks":[{"path":"infra/install-db/1.0","order":1}]}"#,
+        )
+        .unwrap();
+        let task = root.join("infra/install-db/1.0");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("task.json"),
+            r#"{"type":"blaster:task","group":"infra","name":"install-db","version":"1.0",
+                "tasks":[{"name":"x","commands":[{"cmd":"true"}]}]}"#,
+        )
+        .unwrap();
+
+        let found = PackageDefinition::requirements_of(&root, "infra/db-stack/1.0")
+            .expect("a package declaring requirements");
+        assert_eq!(found.0, "db-stack");
+        assert_eq!(found.1.min_memory_mb, Some(1024));
+        assert!(PackageDefinition::requirements_of(&root, "infra/install-db/1.0").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 }
