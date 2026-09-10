@@ -1,36 +1,82 @@
-//! The model has to parse what is actually in the repository, not a tidied subset of it.
+//! The model has to parse real definitions, not a tidied subset of them.
 //!
-//! These 35 files are the real input to every deployment. A field this model does not know about
-//! is not a theoretical problem — it is a task that silently loses a command, or a run that fails
-//! at parse time in front of a half-configured host. Parsing all of them, and asserting the
-//! commands survive, is cheap insurance that costs one test.
+//! A field this model does not know about is not a theoretical problem — it is a task that
+//! silently loses a command, or a run that fails at parse time in front of a half-configured
+//! host. Parsing every definition, and asserting the commands survive, is cheap insurance.
+//!
+//! # Where the definitions come from
+//!
+//! `tests/corpus/` always, and anything `BIGBANG_TASK_CORPUS` names (colon-separated) as well.
+//!
+//! This used to be one hardcoded path into the repository that contained this crate, skipped
+//! with a printed line when absent. Extracting this crate into its own repository made that
+//! path vanish, and all four guards below went on reporting `ok` while reading nothing: 44
+//! definitions and 888 commands of coverage, gone silently. A skip is how a structural guard
+//! dies, so there is none — an empty corpus fails.
 
 use std::path::PathBuf;
 
 use bigbang::task::TaskDefinition;
 
-fn tasks_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../src/main/resources/deployment/tasks")
+/// Every definition the guards should read.
+///
+/// Panics rather than returning empty. The whole point of these tests is breadth, and breadth
+/// that can quietly become zero is not a guard.
+fn corpus() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")];
+    match std::env::var("BIGBANG_TASK_CORPUS").as_deref() {
+        // An explicit opt-out, for somewhere there is genuinely nothing to point at. It still
+        // leaves the bundled corpus, so it cannot reduce this to nothing.
+        Ok("none") | Err(_) => {}
+        Ok(list) => roots.extend(list.split(':').filter(|p| !p.is_empty()).map(PathBuf::from)),
+    }
+    // Kept so this still sweeps everything when the two repositories sit side by side.
+    for sibling in ["../bigbang-library/tasks", "../src/main/resources/deployment/tasks"] {
+        let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(sibling);
+        if candidate.is_dir() {
+            roots.push(candidate);
+        }
+    }
+
+    // By file name, later roots winning: a corpus pointed at the library replaces the bundled
+    // copy of the same definition rather than being counted beside it.
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for root in &roots {
+        if !root.is_dir() {
+            panic!(
+                "BIGBANG_TASK_CORPUS names {}, which is not a directory",
+                root.display()
+            );
+        }
+        for entry in std::fs::read_dir(root).expect("reading a corpus directory") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                by_name.insert(name, path);
+            }
+        }
+    }
+    let files: Vec<PathBuf> = by_name.into_values().collect();
+    assert!(
+        !files.is_empty(),
+        "no task definitions found in {:?}. tests/corpus/ ships with this repository, so an \
+         empty result means it was deleted — these guards measure breadth and cannot pass \
+         against nothing.",
+        roots
+    );
+    files
 }
 
 #[test]
 fn every_task_definition_in_the_repository_parses() {
-    let dir = tasks_dir();
-    if !dir.exists() {
-        eprintln!("skipping: {} not present", dir.display());
-        return;
-    }
+    let files = corpus();
 
     let mut parsed = 0usize;
     let mut commands = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
+    for path in &files {
+        let path = path.as_path();
         match TaskDefinition::load_file(&path) {
             Ok(def) => {
                 parsed += 1;
@@ -50,8 +96,12 @@ fn every_task_definition_in_the_repository_parses() {
     }
 
     assert!(failures.is_empty(), "{} file(s) failed to parse:\n{}", failures.len(), failures.join("\n"));
-    assert!(parsed >= 30, "expected the repository's task files, parsed only {parsed}");
-    assert!(commands >= 500, "expected several hundred commands, counted {commands}");
+    assert_eq!(
+        parsed, files.len(),
+        "every definition in the corpus must parse — {} of {} did",
+        parsed, files.len()
+    );
+    assert!(commands > 0, "a corpus of {} file(s) produced no commands at all", files.len());
     eprintln!("parsed {parsed} task definitions, {commands} commands");
 }
 
@@ -67,18 +117,11 @@ const DECLARES_UNIMPLEMENTED: &[&str] = &[];
 
 #[test]
 fn only_the_known_definitions_declare_unimplemented_features() {
-    let dir = tasks_dir();
-    if !dir.exists() {
-        eprintln!("skipping: {} not present", dir.display());
-        return;
-    }
+    let files = corpus();
 
     let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
+    for path in &files {
+        let path = path.as_path();
         let Ok(def) = TaskDefinition::load_file(&path) else { continue };
         let unhonoured = bigbang::task::unhonoured_fields(&def);
         if !unhonoured.is_empty() {
@@ -118,20 +161,13 @@ fn only_the_known_definitions_declare_unimplemented_features() {
 /// inert. A count asserted here means the field cannot quietly disappear again.
 #[test]
 fn assertions_in_repository_definitions_are_not_dropped() {
-    let dir = tasks_dir();
-    if !dir.exists() {
-        eprintln!("skipping: {} not present", dir.display());
-        return;
-    }
+    let files = corpus();
 
     let mut total = 0usize;
     let mut files_with = Vec::new();
 
-    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
+    for path in &files {
+        let path = path.as_path();
         // Only count what the raw file actually declares, so this compares model against file.
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         if !raw.contains("\"assertions\"") {
@@ -183,11 +219,7 @@ fn assertions_in_repository_definitions_are_not_dropped() {
 /// the enable so it cannot run until one exists.
 #[test]
 fn no_task_enables_a_firewall_before_allowing_ssh() {
-    let dir = tasks_dir();
-    if !dir.exists() {
-        eprintln!("skipping: {} not present", dir.display());
-        return;
-    }
+    let files = corpus();
 
     fn enables_firewall(cmd: &str) -> bool {
         let c = cmd.to_lowercase();
@@ -203,11 +235,8 @@ fn no_task_enables_a_firewall_before_allowing_ssh() {
     let mut offenders: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    for entry in std::fs::read_dir(&dir).expect("reading the tasks directory") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
+    for path in &files {
+        let path = path.as_path();
         let Ok(def) = TaskDefinition::load_file(&path) else { continue };
 
         // Flatten to the order the executor runs them in.

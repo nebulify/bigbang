@@ -1,0 +1,134 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "install-nginx",
+  "version": "1.0",
+  "description": "nginx, its TLS parameters and a catch-all that refuses unknown hosts. SHARED: a host runs one nginx however many projects it serves, so this is idempotent, additive, and touches nothing a project owns.",
+  "variables": {
+    "acme_webroot": "/var/www/acme",
+    "dhparam_size": "2048"
+  },
+  "selectors": [
+    "web-server",
+    "edge",
+    "load-balancer"
+  ],
+  "environment": {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  },
+  "tasks": [
+    {
+      "name": "Install nginx and certbot",
+      "description": "certbot comes with nginx because a site without TLS is not a finished site",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "apt-get update -qq",
+          "timeout": 300
+        },
+        {
+          "cmd": "apt-get install -y -qq nginx certbot openssl",
+          "timeout": 600
+        }
+      ],
+      "verification": [
+        "command -v nginx",
+        "command -v certbot"
+      ]
+    },
+    {
+      "name": "Make the ACME webroot",
+      "description": "One webroot for every project's challenges, so a project can obtain its first certificate before it has a site",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "install -d -o root -g root -m 0755 ${acme_webroot}/.well-known/acme-challenge"
+        }
+      ],
+      "verification": [
+        "test -d ${acme_webroot}/.well-known/acme-challenge"
+      ]
+    },
+    {
+      "name": "Generate DH parameters",
+      "description": "Needed by ssl_dhparam in the TLS snippet. Minutes of CPU, so never twice.",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "openssl dhparam -out /etc/nginx/dhparam.pem ${dhparam_size}",
+          "skipIf": "test -s /etc/nginx/dhparam.pem",
+          "timeout": 1800
+        }
+      ],
+      "verification": [
+        "test -s /etc/nginx/dhparam.pem"
+      ]
+    },
+    {
+      "name": "Place the TLS parameters snippet",
+      "description": "The ciphers, protocols and stapling every site includes, in one file",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "nginx-common/ssl-params.conf",
+            "remotePath": "/etc/nginx/snippets/ssl-params.conf",
+            "mode": "0644"
+          }
+        }
+      ],
+      "verification": [
+        "grep -q 'ssl_protocols TLSv1.2 TLSv1.3' /etc/nginx/snippets/ssl-params.conf"
+      ]
+    },
+    {
+      "name": "Place the catch-all site",
+      "description": "Answers for any host no project claims. Replaces the distribution default, which serves nginx's welcome page to anything that resolves here.",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "install-nginx/catch-all.conf",
+            "remotePath": "/etc/nginx/sites-available/000-catch-all",
+            "mode": "0644"
+          }
+        }
+      ],
+      "commands": [
+        {
+          "cmd": "ln -sfn /etc/nginx/sites-available/000-catch-all /etc/nginx/sites-enabled/000-catch-all"
+        },
+        {
+          "cmd": "rm -f /etc/nginx/sites-enabled/default"
+        },
+        {
+          "cmd": "nginx -t"
+        }
+      ],
+      "verification": [
+        "test -L /etc/nginx/sites-enabled/000-catch-all",
+        "! test -e /etc/nginx/sites-enabled/default",
+        "nginx -t"
+      ]
+    },
+    {
+      "name": "Start nginx",
+      "description": "Enabled as well as started: a host that reboots must come back serving",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "systemctl enable nginx"
+        },
+        {
+          "cmd": "systemctl reload nginx || systemctl restart nginx"
+        }
+      ],
+      "verification": [
+        "systemctl is-active nginx"
+      ]
+    }
+  ]
+}

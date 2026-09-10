@@ -1,0 +1,46 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "create-postgresql-database",
+  "version": "1.0",
+  "description": "Create application database if it does not exist and set owner",
+  "variables": {
+    "db_name": "appdb",
+    "app_user": "appuser",
+    "db_encoding": "UTF8",
+    "db_locale": "C"
+  },
+  "selectors": [
+    "database-server",
+    "postgres-server",
+    "vps"
+  ],
+  "tasks": [
+    {
+      "name": "Create database with proper owner",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "skipIf": "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\" | grep -q 1",
+          "cmd": "sudo -u postgres createdb -E ${db_encoding} --locale=${db_locale} -T template0 -O ${app_user} ${db_name}",
+          "assertions": [
+            {
+              "type": "NOT_CONTAINS",
+              "pattern": "ERROR",
+              "message": "Database creation should succeed"
+            },
+            {
+              "type": "NOT_CONTAINS",
+              "pattern": "already exists",
+              "message": "Database should not already exist at this point"
+            }
+          ]
+        }
+      ],
+      "verification": [
+        "sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\" | grep -q 1"
+      ]
+    }
+  ]
+}

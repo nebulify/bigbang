@@ -31,21 +31,21 @@ die()  { printf '   \033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 say "Build"
 command -v cargo >/dev/null || die "cargo not found — install Rust from https://rustup.rs"
 if [ "$PROFILE" = release ]; then
-  ( cd "$REPO/bigbang-rs" && cargo build --release ) || die "cargo build failed"
+  ( cd "$REPO" && cargo build --release ) || die "cargo build failed"
 else
-  ( cd "$REPO/bigbang-rs" && cargo build ) || die "cargo build failed"
+  ( cd "$REPO" && cargo build ) || die "cargo build failed"
 fi
-SRC="$REPO/bigbang-rs/target/$PROFILE/bigbang"
+SRC="$REPO/target/$PROFILE/bigbang"
 # bb is the client for the unlocked-vault agent; it is useless without bigbang and useless if it
 # is not on PATH beside it, so the two are installed together or not at all.
-SRC_BB="$REPO/bigbang-rs/target/$PROFILE/bb"
+SRC_BB="$REPO/target/$PROFILE/bb"
 [ -x "$SRC" ] || die "expected a binary at $SRC"
 ok "$SRC ($(du -h "$SRC" | cut -f1))"
 
 say "Test"
 # The suite is fast enough that skipping it saves nothing worth having, and it covers the
 # parts that decide a deployment's behaviour — skipIf, retries, vault crypto, role matching.
-( cd "$REPO/bigbang-rs" && cargo test --quiet ) || die "tests failed — not installing"
+( cd "$REPO" && cargo test --quiet ) || die "tests failed — not installing"
 ok "tests pass"
 
 say "Install"

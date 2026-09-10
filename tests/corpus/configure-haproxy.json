@@ -1,0 +1,141 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "configure-haproxy",
+  "version": "1.0",
+  "description": "Configure HAProxy for load balancing with health checks, stats page, and production-ready settings",
+  "variables": {
+    "haproxy_stats_port": "8404",
+    "haproxy_stats_user": "admin",
+    "haproxy_stats_password": "",
+    "backend_servers": "",
+    "backend_port": "80",
+    "frontend_port": "80",
+    "frontend_ssl_port": "443",
+    "balance_algorithm": "roundrobin",
+    "health_check_interval": "2s",
+    "maxconn": "4096"
+  },
+  "selectors": [
+    "load-balancer",
+    "haproxy-server",
+    "vps"
+  ],
+  "environment": {
+    "DEBIAN_FRONTEND": "noninteractive"
+  },
+  "tasks": [
+    {
+      "name": "Refuse without the values that differ per environment",
+      "description": "A default password is not a password. Better to stop here than to publish the stats page with 'changeme'.",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "case \"${haproxy_stats_password}\" in \"\") echo \"haproxy_stats_password has no value. The stats page at :${haproxy_stats_port}/stats is reachable by anyone who can reach the host, so it needs a real one. Set it in the recipe, or from the vault.\" >&2; exit 1 ;; esac"
+        }
+      ]
+    },
+    {
+      "name": "Backup original configuration",
+      "description": "Create backup of original HAProxy configuration",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.backup-$(date +%Y%m%d-%H%M%S)",
+          "skipIf": "[ -f /etc/haproxy/haproxy.cfg.original ]"
+        },
+        {
+          "cmd": "cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.original",
+          "skipIf": "[ -f /etc/haproxy/haproxy.cfg.original ]"
+        }
+      ]
+    },
+    {
+      "name": "Place the HAProxy configuration",
+      "description": "Globals, defaults, the stats listener and the http frontend/backend pair",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "configure-haproxy/haproxy.cfg",
+            "remotePath": "/etc/haproxy/haproxy.cfg",
+            "mode": "0644"
+          }
+        }
+      ],
+      "verification": [
+        "[ -f /etc/haproxy/haproxy.cfg ]",
+        "grep -q 'balance ${balance_algorithm}' /etc/haproxy/haproxy.cfg"
+      ]
+    },
+    {
+      "name": "Add backend servers to configuration",
+      "description": "Add backend servers to HAProxy configuration if provided",
+      "runAs": "root",
+      "condition": "[ -n \"${backend_servers}\" ]",
+      "commands": [
+        {
+          "cmd": "echo \"${backend_servers}\" | tr ',' '\\n' | awk -v port=\"${backend_port}\" -v interval=\"${health_check_interval}\" '{i++; print \"    server backend\" i \" \" $1 \":\" port \" check inter \" interval}' >> /etc/haproxy/haproxy.cfg"
+        }
+      ]
+    },
+    {
+      "name": "Validate HAProxy configuration",
+      "description": "Check HAProxy configuration syntax",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "haproxy -c -f /etc/haproxy/haproxy.cfg",
+          "timeout": 30
+        }
+      ]
+    },
+    {
+      "name": "Restart HAProxy service",
+      "description": "Restart HAProxy to apply configuration",
+      "runAs": "root",
+      "commands": [
+        "systemctl restart haproxy"
+      ],
+      "verification": [
+        "systemctl is-active haproxy"
+      ]
+    },
+    {
+      "name": "Enable HAProxy service",
+      "description": "Enable HAProxy to start on boot",
+      "runAs": "root",
+      "commands": [
+        "systemctl enable haproxy"
+      ],
+      "verification": [
+        "systemctl is-enabled haproxy"
+      ]
+    },
+    {
+      "name": "Display configuration summary",
+      "description": "Show HAProxy configuration details",
+      "runAs": "root",
+      "commands": [
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'",
+        "echo '  HAProxy Configuration Summary'",
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'",
+        "echo \"Frontend Port: ${frontend_port}\"",
+        "echo \"Backend Port: ${backend_port}\"",
+        "echo \"Balance Algorithm: ${balance_algorithm}\"",
+        "echo \"Health Check Interval: ${health_check_interval}\"",
+        "echo \"Max Connections: ${maxconn}\"",
+        "echo ''",
+        "echo \"Stats Interface: http://YOUR_IP:${haproxy_stats_port}/stats\"",
+        "echo \"Stats User: ${haproxy_stats_user}\"",
+        "echo ''",
+        "echo 'Backend Servers:'",
+        "grep -A 20 'backend http_back' /etc/haproxy/haproxy.cfg | grep 'server ' | sed 's/^/  /' || echo '  No backend servers configured yet'",
+        "echo ''",
+        "echo '\u2705 HAProxy configured successfully'",
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'"
+      ]
+    }
+  ]
+}

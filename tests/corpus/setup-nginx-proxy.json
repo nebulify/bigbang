@@ -1,0 +1,383 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "setup-nginx-proxy",
+  "version": "1.0",
+  "description": "Setup Nginx with secure TLS configuration, Let's Encrypt support, and Nebulify landing page",
+  "variables": {
+    "nginx_user": "www-data",
+    "dhparam_size": "4096",
+    "nginx_html_path": "/usr/share/nginx/html",
+    "jump_host_private_ip": "",
+    "private_ip_address": ""
+  },
+  "selectors": [
+    "load-balancer"
+  ],
+  "environment": {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "PATH": "/snap/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  },
+  "tasks": [
+    {
+      "name": "Update apt cache",
+      "description": "Update package lists from repositories",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "apt-get update -qq",
+          "timeout": 300
+        }
+      ]
+    },
+    {
+      "name": "Upgrade all packages",
+      "description": "Perform full system upgrade",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "apt-get dist-upgrade -y -qq",
+          "timeout": 1800
+        },
+        "apt-get autoremove -y -qq",
+        "apt-get autoclean -y -qq"
+      ]
+    },
+    {
+      "name": "Install required packages",
+      "description": "Install nginx, certbot, and dependencies",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "apt-get install -y -qq nginx certbot python3-certbot-nginx openssl cron ufw",
+          "timeout": 600
+        }
+      ],
+      "verification": [
+        "which nginx",
+        "which certbot",
+        "which openssl"
+      ]
+    },
+    {
+      "name": "Stop nginx for initial configuration",
+      "description": "Stop nginx to allow configuration changes",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "systemctl stop nginx",
+          "skipIf": "systemctl is-active nginx | grep -q inactive"
+        }
+      ]
+    },
+    {
+      "name": "Generate DH parameters",
+      "description": "Generate Diffie-Hellman parameters for TLS (may take several minutes)",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "openssl dhparam -out /etc/nginx/dhparam.pem ${dhparam_size}",
+          "skipIf": "[ -f /etc/nginx/dhparam.pem ]",
+          "timeout": 3600
+        }
+      ],
+      "verification": [
+        "[ -f /etc/nginx/dhparam.pem ]"
+      ]
+    },
+    {
+      "name": "Place the TLS parameters snippet",
+      "description": "The ciphers, protocols and stapling every site includes, in one file",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "nginx-common/ssl-params.conf",
+            "remotePath": "/etc/nginx/snippets/ssl-params.conf",
+            "mode": "0644"
+          }
+        }
+      ],
+      "verification": [
+        "[ -f /etc/nginx/snippets/ssl-params.conf ]",
+        "grep -q 'ssl_protocols TLSv1.2 TLSv1.3' /etc/nginx/snippets/ssl-params.conf"
+      ]
+    },
+    {
+      "name": "Keep the distribution nginx.conf",
+      "description": "Copied once, before ours replaces it; a re-run must not overwrite that copy with ours",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "cp -n /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup"
+        }
+      ],
+      "verification": [
+        "[ -f /etc/nginx/nginx.conf.backup ]"
+      ]
+    },
+    {
+      "name": "Place nginx.conf",
+      "description": "Workers, gzip, logging and the two includes every site relies on",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/nginx.conf",
+            "remotePath": "/etc/nginx/nginx.conf",
+            "mode": "0644"
+          }
+        }
+      ],
+      "verification": [
+        "nginx -t"
+      ]
+    },
+    {
+      "name": "Remove default site from sites-enabled",
+      "description": "Remove default nginx site configuration",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "rm -f /etc/nginx/sites-enabled/default",
+          "skipIf": "[ ! -f /etc/nginx/sites-enabled/default ]"
+        }
+      ]
+    },
+    {
+      "name": "Ensure nginx html directory exists",
+      "description": "Create nginx web root directory with correct permissions",
+      "runAs": "root",
+      "commands": [
+        "mkdir -p ${nginx_html_path}",
+        "chown ${nginx_user}:${nginx_user} ${nginx_html_path}",
+        "chmod 755 ${nginx_html_path}"
+      ],
+      "verification": [
+        "[ -d ${nginx_html_path} ]",
+        "[ -w ${nginx_html_path} ]"
+      ]
+    },
+    {
+      "name": "Place the landing page",
+      "description": "The page served for a host that matches no site",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/index.html",
+            "remotePath": "${nginx_html_path}/index.html",
+            "mode": "0644"
+          }
+        }
+      ],
+      "commands": [
+        {
+          "cmd": "chown ${nginx_user}:${nginx_user} ${nginx_html_path}/index.html"
+        }
+      ],
+      "verification": [
+        "[ -f ${nginx_html_path}/index.html ]"
+      ]
+    },
+    {
+      "name": "Place the logos",
+      "description": "The three SVGs the landing page references",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/nebulify-logo.svg",
+            "remotePath": "${nginx_html_path}/nebulify-logo.svg",
+            "mode": "0644"
+          }
+        },
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/nebulify-icon.svg",
+            "remotePath": "${nginx_html_path}/nebulify-icon.svg",
+            "mode": "0644"
+          }
+        },
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/nebulify-logo-horizontal.svg",
+            "remotePath": "${nginx_html_path}/nebulify-logo-horizontal.svg",
+            "mode": "0644"
+          }
+        }
+      ],
+      "commands": [
+        {
+          "cmd": "chown ${nginx_user}:${nginx_user} ${nginx_html_path}/nebulify-logo.svg ${nginx_html_path}/nebulify-icon.svg ${nginx_html_path}/nebulify-logo-horizontal.svg"
+        }
+      ],
+      "verification": [
+        "[ -f ${nginx_html_path}/nebulify-logo.svg ]",
+        "[ -f ${nginx_html_path}/nebulify-icon.svg ]",
+        "[ -f ${nginx_html_path}/nebulify-logo-horizontal.svg ]"
+      ]
+    },
+    {
+      "name": "Place the catch-all site",
+      "description": "The server block that answers a request for any host with no site of its own",
+      "runAs": "root",
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "setup-nginx-proxy/default-site.conf",
+            "remotePath": "/etc/nginx/sites-available/default",
+            "mode": "0644"
+          }
+        }
+      ],
+      "verification": [
+        "[ -f /etc/nginx/sites-available/default ]",
+        "grep -q 'server_name _;' /etc/nginx/sites-available/default"
+      ]
+    },
+    {
+      "name": "Enable default site",
+      "description": "Create symlink to enable default site",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default",
+          "skipIf": "[ -L /etc/nginx/sites-enabled/default ]"
+        }
+      ],
+      "verification": [
+        "[ -L /etc/nginx/sites-enabled/default ]"
+      ]
+    },
+    {
+      "name": "Test nginx configuration",
+      "description": "Validate nginx configuration syntax",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "nginx -t",
+          "timeout": 30
+        }
+      ]
+    },
+    {
+      "name": "Start and enable nginx",
+      "description": "Start nginx service and enable on boot",
+      "runAs": "root",
+      "commands": [
+        "systemctl start nginx",
+        "systemctl enable nginx"
+      ],
+      "verification": [
+        "systemctl is-active nginx"
+      ]
+    },
+    {
+      "name": "Setup certbot auto-renewal",
+      "description": "Configure automatic SSL certificate renewal",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "echo '0 3 1 * * certbot renew --quiet --post-hook \"systemctl reload nginx\"' | crontab -",
+          "skipIf": "crontab -l 2>/dev/null | grep -q 'certbot renew'"
+        }
+      ],
+      "verification": [
+        "crontab -l 2>/dev/null | grep -q 'certbot renew'"
+      ]
+    },
+    {
+      "name": "Configure firewall - Allow HTTP/HTTPS on all IPs",
+      "description": "Allow HTTP (80) and HTTPS (443) on both public and private IP addresses",
+      "runAs": "root",
+      "continueOnError": true,
+      "condition": "command -v ufw >/dev/null 2>&1 && ! test -f /.dockerenv && ! grep -q docker /proc/1/cgroup 2>/dev/null",
+      "commands": [
+        {
+          "cmd": "ufw allow 80/tcp comment 'HTTP on all interfaces'",
+          "skipIf": "ufw status | grep -q '80/tcp.*ALLOW'"
+        },
+        {
+          "cmd": "ufw allow 443/tcp comment 'HTTPS on all interfaces'",
+          "skipIf": "ufw status | grep -q '443/tcp.*ALLOW'"
+        }
+      ],
+      "verification": [
+        "ufw status | grep -q '80/tcp'",
+        "ufw status | grep -q '443/tcp'"
+      ]
+    },
+    {
+      "name": "Configure firewall - Restrict SSH to jump host only",
+      "description": "Allow SSH only from jump host IP on private interface",
+      "runAs": "root",
+      "continueOnError": true,
+      "condition": "[ -n \"${jump_host_private_ip}\" ] && command -v ufw >/dev/null 2>&1 && ! test -f /.dockerenv && ! grep -q docker /proc/1/cgroup 2>/dev/null",
+      "commands": [
+        {
+          "cmd": "ufw delete allow 22/tcp 2>/dev/null || true",
+          "skipIf": "! ufw status | grep -q '^22/tcp.*ALLOW.*Anywhere'"
+        },
+        {
+          "cmd": "ufw allow from ${jump_host_private_ip} to ${private_ip_address} port 22 proto tcp comment 'SSH from jump host only'",
+          "skipIf": "ufw status | grep -q 'from ${jump_host_private_ip}.*22/tcp'"
+        }
+      ],
+      "verification": [
+        "ufw status | grep -q '22/tcp.*${jump_host_private_ip}'"
+      ]
+    },
+    {
+      "name": "Configure firewall - Allow SSH from anywhere (fallback)",
+      "description": "If no jump host configured, allow SSH from anywhere as fallback",
+      "runAs": "root",
+      "continueOnError": true,
+      "condition": "[ -z \"${jump_host_private_ip}\" ] && command -v ufw >/dev/null 2>&1 && ! test -f /.dockerenv && ! grep -q docker /proc/1/cgroup 2>/dev/null",
+      "commands": [
+        {
+          "cmd": "ufw allow 22/tcp comment 'SSH (no jump host configured)'",
+          "skipIf": "ufw status | grep -q '22/tcp.*ALLOW'"
+        }
+      ]
+    },
+    {
+      "name": "Configure firewall - Enable UFW",
+      "description": "Enabled last, and only once an SSH allow rule is present. `ufw show added` is used rather than `ufw status` because an inactive firewall reports no rules at all.",
+      "runAs": "root",
+      "continueOnError": true,
+      "condition": "command -v ufw >/dev/null 2>&1 && ! test -f /.dockerenv && ! grep -q docker /proc/1/cgroup 2>/dev/null",
+      "commands": [
+        {
+          "cmd": "ufw --force enable",
+          "skipIf": "ufw status | grep -q 'Status: active'",
+          "runIf": "ufw show added | grep -E 'allow' | grep -qw '22'"
+        }
+      ],
+      "verification": [
+        "ufw status | grep -q '22.*ALLOW'"
+      ]
+    },
+    {
+      "name": "Configure firewall - Show status",
+      "description": "Display final firewall configuration",
+      "runAs": "root",
+      "continueOnError": true,
+      "condition": "command -v ufw >/dev/null 2>&1 && ! test -f /.dockerenv && ! grep -q docker /proc/1/cgroup 2>/dev/null",
+      "commands": [
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'",
+        "echo '  Firewall Configuration'",
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'",
+        "ufw status numbered",
+        "echo '\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550'"
+      ]
+    }
+  ]
+}

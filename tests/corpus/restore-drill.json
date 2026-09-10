@@ -1,0 +1,194 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "restore-drill",
+  "version": "1.0",
+  "description": "Restore the backup repository to a scratch cluster, prove it works, record how long it took, then destroy it",
+  "selectors": [
+    "database-server",
+    "postgres-server"
+  ],
+  "variables": {
+    "stanza": "",
+    "live_data_dir": "/var/lib/postgresql/${postgres_major_version}/main",
+    "drill_data_dir": "/var/lib/postgresql/restore-drill",
+    "drill_port": "5433",
+    "live_port": "5432",
+    "schema_name": "",
+    "recovery_target": "immediate",
+    "postgres_major_version": "17",
+    "pg_bin": "/usr/lib/postgresql/${postgres_major_version}/bin",
+    "drill_db": ""
+  },
+  "tasks": [
+    {
+      "name": "Refuse without the values that differ per environment",
+      "description": "Each of these had a default naming one environment, and a default that names an environment is how a run acts on the wrong one. Checked one line per value, with no privilege needed: a guard that can fail for its own reasons is not a guard.",
+      "commands": [
+        {
+          "cmd": "case \"${stanza}\" in ''|*'$'*) echo 'REFUSING: stanza must be supplied' >&2; exit 1 ;; esac"
+        },
+        {
+          "cmd": "case \"${schema_name}\" in ''|*'$'*) echo 'REFUSING: schema_name must be supplied' >&2; exit 1 ;; esac"
+        }
+      ],
+      "verification": [
+        "test -n \"${stanza}\"",
+        "test -n \"${schema_name}\""
+      ]
+    },
+    {
+      "name": "Refuse without the tools the drill needs",
+      "description": "pg_ctl is not on PATH on Debian \u2014 it lives under /usr/lib/postgresql/<version>/bin, and the package provides pg_ctlcluster instead. The drill called it by bare name, so every run restored 833 MB from the repository and then failed to start the cluster with 'command not found'. The steps that prove the restored database is real never ran, and the drill had never actually verified a restore. Checked first now, because the whole point of this task is to find that out before an incident does.",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "test -x ${pg_bin}/pg_ctl || { echo 'REFUSING: ${pg_bin}/pg_ctl is missing \u2014 the drill cannot start the restored cluster, and would otherwise restore the data and stop there' >&2; exit 1; }; echo \"using $(${pg_bin}/pg_ctl --version)\""
+        },
+        {
+          "cmd": "case \"${drill_db}\" in ''|*'$'*) echo 'REFUSING: drill_db must be supplied \u2014 the drill previously verified a database named db_colistor, which only exists in production' >&2; exit 1;; esac; echo \"will verify database ${drill_db}\""
+        }
+      ]
+    },
+    {
+      "name": "Refuse to run anywhere near the live cluster",
+      "description": "The only way this task destroys data is by being pointed at the wrong path or port, so both are checked before anything else happens",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "cmd": "if [ \"${drill_data_dir}\" = \"${live_data_dir}\" ]; then echo 'REFUSING: drill_data_dir is the live data directory'; exit 1; fi",
+          "description": "A restore over the live directory is the one irreversible mistake available here"
+        },
+        {
+          "cmd": "if [ \"${drill_port}\" = \"${live_port}\" ]; then echo 'REFUSING: drill_port is the live port'; exit 1; fi"
+        },
+        {
+          "cmd": "case \"${drill_data_dir}\" in /var/lib/postgresql/*) : ;; *) echo 'REFUSING: drill_data_dir must live under /var/lib/postgresql'; exit 1 ;; esac"
+        },
+        {
+          "cmd": "echo \"drill: ${drill_data_dir} on port ${drill_port}; live untouched at ${live_data_dir}:${live_port}\""
+        }
+      ]
+    },
+    {
+      "name": "Clear any previous drill",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "cmd": "if [ -d ${drill_data_dir} ]; then sudo -u postgres ${pg_bin}/pg_ctl -D ${drill_data_dir} stop -m immediate || true; rm -rf ${drill_data_dir}; fi",
+          "timeout": 120
+        },
+        {
+          "cmd": "install -d -o postgres -g postgres -m 0700 ${drill_data_dir}"
+        }
+      ]
+    },
+    {
+      "name": "Restore from the repository",
+      "description": "This is the step being measured \u2014 everything before it is setup",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "cmd": "date +%s > /tmp/restore-drill-start",
+          "description": "Elapsed time is the output that matters; without it the drill proves restorability but not the recovery objective"
+        },
+        {
+          "cmd": "sudo -u postgres pgbackrest --stanza=${stanza} --pg1-path=${drill_data_dir} --type=${recovery_target} restore",
+          "timeout": 7200,
+          "description": "type=immediate stops at the earliest consistent point: fastest, and enough to prove the repository is usable"
+        }
+      ],
+      "verification": [
+        "test -f ${drill_data_dir}/PG_VERSION",
+        "test -f ${drill_data_dir}/recovery.signal"
+      ]
+    },
+    {
+      "name": "Make the scratch cluster safe to start",
+      "description": "Debian keeps postgresql.conf in /etc/postgresql/<version>/main, so a data directory restored from a repository contains no configuration at all and the server exits with 'could not access the server configuration file'. A minimal file is written here rather than the live one copied, deliberately: the live postgresql.conf sets data_directory to the live cluster, and a drill that inherited that setting would start a second postmaster on top of production data \u2014 the one irreversible mistake this task is built to avoid. The connection and lock parameters are read from the live cluster rather than chosen: Postgres refuses to finish recovery if the restored cluster offers less than the primary did (\"recovery aborted because of insufficient parameter settings\"), so a fixed value here would work until someone raised max_connections in production and then fail only at the next drill.",
+      "runAs": "root",
+      "continueOnError": false,
+      "functions": [
+        {
+          "function": "uploadTemplate",
+          "params": {
+            "templatePath": "restore-drill/write-scratch-config.sh",
+            "remotePath": "/usr/local/sbin/restore-drill-write-config",
+            "mode": "0750"
+          }
+        }
+      ],
+      "commands": [
+        {
+          "cmd": "/usr/local/sbin/restore-drill-write-config"
+        }
+      ],
+      "verification": [
+        "grep -q 'archive_mode = off' ${drill_data_dir}/postgresql.auto.conf",
+        "! grep -q '^data_directory' ${drill_data_dir}/postgresql.conf",
+        "test \"$(grep -oP '^max_connections = \\K[0-9]+' ${drill_data_dir}/postgresql.conf)\" -ge \"$(sudo -u postgres psql -tAXc 'show max_connections' | tr -d ' ')\""
+      ]
+    },
+    {
+      "name": "Start it and wait for recovery to finish",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "cmd": "sudo -u postgres ${pg_bin}/pg_ctl -D ${drill_data_dir} -l /tmp/restore-drill.log -w -t 600 start",
+          "timeout": 900
+        },
+        {
+          "cmd": "sudo -u postgres psql -p ${drill_port} -h localhost -tAc 'SELECT 1'",
+          "timeout": 120,
+          "retries": 10,
+          "retryDelay": 10
+        }
+      ]
+    },
+    {
+      "name": "Prove the restored database is the real one",
+      "description": "A cluster that starts is not a cluster that has your data",
+      "runAs": "root",
+      "continueOnError": false,
+      "commands": [
+        {
+          "cmd": "END=$(date +%s); START=$(cat /tmp/restore-drill-start); echo \"RESTORE DRILL: ${stanza} restored and serving in $((END-START)) seconds\"",
+          "description": "The recovery objective, measured rather than estimated"
+        },
+        {
+          "cmd": "sudo -u postgres psql -p ${drill_port} -h localhost -d ${drill_db} -tAc \"SELECT max(version::numeric) FROM ${schema_name}.flyway_schema_history WHERE success\" | tee /tmp/restore-drill-version",
+          "description": "The schema version that was actually restored"
+        },
+        {
+          "cmd": "V=$(cat /tmp/restore-drill-version | tr -d ' '); if [ -z \"$V\" ] || [ \"$V\" = \"\" ]; then echo 'FAILED: no successful migrations in the restored database'; exit 1; fi; echo \"restored schema at V$V\""
+        },
+        {
+          "cmd": "sudo -u postgres psql -p ${drill_port} -h localhost -d ${drill_db} -tAc \"SELECT count(*) FROM ${schema_name}.users\" | xargs -I{} echo 'users restored: {}'",
+          "description": "One real table, so an empty restore cannot pass"
+        }
+      ]
+    },
+    {
+      "name": "Destroy the scratch cluster",
+      "description": "Runs even if the checks failed \u2014 a half-started cluster left on the database host is worse than a failed drill",
+      "runAs": "root",
+      "continueOnError": true,
+      "commands": [
+        {
+          "cmd": "sudo -u postgres ${pg_bin}/pg_ctl -D ${drill_data_dir} stop -m immediate || true",
+          "timeout": 120
+        },
+        {
+          "cmd": "rm -rf ${drill_data_dir} /tmp/restore-drill-start /tmp/restore-drill-version"
+        },
+        {
+          "cmd": "echo 'drill cluster removed; live cluster untouched'"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "type": "blaster:task",
+  "group": "infra",
+  "name": "setup-postgresql-firewall",
+  "version": "1.0",
+  "description": "Firewall rules for a PostgreSQL host. Rules are added first and the firewall is enabled last, guarded so it can never come up without a way back in.",
+  "variables": {
+    "postgres_port": "5432",
+    "jump_host_private_ip": "",
+    "private_ip_address": "",
+    "allowed_subnet": "",
+    "ssh_port": "22"
+  },
+  "selectors": [
+    "database-server",
+    "postgres-server"
+  ],
+  "tasks": [
+    {
+      "name": "Install UFW firewall",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "apt-get install -y -qq ufw",
+          "timeout": 300
+        }
+      ]
+    },
+    {
+      "name": "Allow SSH from the jump host",
+      "description": "Preferred when a bastion is configured: only the jump host may reach SSH",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "ufw allow from ${jump_host_private_ip} to any port ${ssh_port} proto tcp comment 'SSH from jump host'",
+          "runIf": "[ -n '${jump_host_private_ip}' ]",
+          "timeout": 30
+        }
+      ]
+    },
+    {
+      "name": "Allow SSH from anywhere",
+      "description": "The fallback when no jump host is configured. Without this, enabling UFW removes the only route to the machine.",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "ufw allow ${ssh_port}/tcp comment 'SSH (no jump host configured)'",
+          "runIf": "[ -z '${jump_host_private_ip}' ]",
+          "timeout": 30
+        }
+      ]
+    },
+    {
+      "name": "Allow PostgreSQL from the allowed subnet",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "ufw allow from ${allowed_subnet} to any port ${postgres_port} proto tcp comment 'PostgreSQL from allowed subnet'",
+          "runIf": "[ -n '${allowed_subnet}' ]",
+          "timeout": 30
+        }
+      ]
+    },
+    {
+      "name": "Enable UFW",
+      "description": "Last, and only once an SSH rule is actually present. `ufw show added` is used rather than `ufw status` because an inactive firewall reports no rules at all — checking status would have found nothing and told us nothing.",
+      "runAs": "root",
+      "commands": [
+        {
+          "cmd": "ufw --force enable",
+          "skipIf": "ufw status | grep -q 'Status: active'",
+          "runIf": "ufw show added | grep -E 'allow' | grep -qw '${ssh_port}'",
+          "timeout": 60
+        }
+      ],
+      "verification": [
+        "ufw status | grep -q '${ssh_port}.*ALLOW'"
+      ]
+    },
+    {
+      "name": "Show firewall status",
+      "runAs": "root",
+      "commands": [
+        "ufw status numbered"
+      ]
+    }
+  ]
+}
