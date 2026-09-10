@@ -24,6 +24,32 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Matching the Kotlin executor: wrap in `bash -lc` so a login shell, `~` and PATH behave as a task
 /// author expects, then elevate with `sudo -n` — non-interactive, so a host that would prompt for a
 /// password fails immediately instead of hanging forever on a prompt nobody can answer.
+/// Undo the shell wrapping for display.
+///
+/// `wrap_command` produces `bash -lc '<payload>'`, possibly behind `sudo -n`, with every
+/// single quote in the payload escaped as `'"'"'`. Echoing that is why a well-written task
+/// looked like line noise: a one-line guard reading
+///
+/// ```text
+/// case "${stanza}" in ''|*'$'*) echo 'REFUSING: …' >&2; exit 1 ;; esac
+/// ```
+///
+/// was shown as `bash -lc 'case "" in '"'"''"'"'|*'"'"'$'"'"'*) …'`. The wrapper is how
+/// bigbang runs a command; it is not what an operator reading the log needs to see.
+///
+/// Display only — nothing is executed from this, so an imperfect reversal costs legibility
+/// and never correctness. A payload this cannot unwrap is shown exactly as it runs.
+pub fn unwrap_for_display(wrapped: &str) -> String {
+    let (prefix, rest) = match wrapped.strip_prefix("sudo -n ") {
+        Some(rest) => ("sudo ", rest),
+        None => ("", wrapped),
+    };
+    let Some(inner) = rest.strip_prefix("bash -lc '").and_then(|r| r.strip_suffix('\'')) else {
+        return wrapped.to_string();
+    };
+    format!("{prefix}{}", inner.replace("'\"'\"'", "'"))
+}
+
 pub fn wrap_command(rendered: &str, run_as: Option<&str>, variables: &BTreeMap<String, String>) -> String {
     // Single quotes inside the payload are escaped the shell's own way: close, emit an escaped
     // quote, reopen.
@@ -216,7 +242,7 @@ impl CommandExecutor for SshExecutor {
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[SSH] -> {}@{}:{}", self.target.user, self.target.host, self.target.port);
-            println!("$ {}", mask(command, &self.secrets));
+            println!("$ {}", mask(&unwrap_for_display(command), &self.secrets));
         }
         let mut cmd = Command::new("ssh");
         cmd.args(self.argv(command));
@@ -251,7 +277,7 @@ impl CommandExecutor for LocalExecutor {
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[local]");
-            println!("$ {}", mask(command, &self.secrets));
+            println!("$ {}", mask(&unwrap_for_display(command), &self.secrets));
         }
         // Same shape as the SSH path: the deadline kills the whole process group, so a
         // command that hangs is killed rather than left behind.
@@ -386,7 +412,7 @@ fn run_task_with(
         let rendered = wrap_command(&substitute(&detail.cmd, variables), task.run_as.as_deref(), variables);
 
         if should_skip(&detail, variables, task.run_as.as_deref(), executor)? {
-            outcome.skipped.push(rendered);
+            outcome.skipped.push(unwrap_for_display(&rendered));
             continue;
         }
 
@@ -402,22 +428,22 @@ fn run_task_with(
             if let Some(reason) = failed_assertion(&detail, &result.output) {
                 let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
                 if tolerated {
-                    outcome.ran.push(rendered);
+                    outcome.ran.push(unwrap_for_display(&rendered));
                     continue;
                 }
-                outcome.failed = Some(format!("{rendered}: {reason}"));
+                outcome.failed = Some(format!("{}: {reason}", unwrap_for_display(&rendered)));
                 return Ok(outcome);
             }
-            outcome.ran.push(rendered);
+            outcome.ran.push(unwrap_for_display(&rendered));
             continue;
         }
 
         let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
         if tolerated {
-            outcome.ran.push(rendered);
+            outcome.ran.push(unwrap_for_display(&rendered));
             continue;
         }
-        outcome.failed = Some(format!("{rendered} (exit {})", result.exit_code));
+        outcome.failed = Some(format!("{} (exit {})", unwrap_for_display(&rendered), result.exit_code));
         return Ok(outcome);
     }
 
@@ -425,7 +451,7 @@ fn run_task_with(
     for check in &task.verification {
         let rendered = wrap_command(&substitute(check, variables), task.run_as.as_deref(), variables);
         if !executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
-            outcome.failed = Some(format!("verification failed: {rendered}"));
+            outcome.failed = Some(format!("verification failed: {}", unwrap_for_display(&rendered)));
             return Ok(outcome);
         }
     }
@@ -932,5 +958,28 @@ mod tests {
             "a grandchild outlived the deadline and finished its work"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn a_command_is_shown_as_the_task_wrote_it() {
+        // What made well-written tasks look like line noise: the log showed the wrapper
+        // and the doubled quote escaping instead of the command.
+        let guard = "case \"${stanza}\" in ''|*'$'*) echo 'REFUSING: stanza' >&2; exit 1 ;; esac";
+        let wrapped = wrap_command(guard, None, &BTreeMap::new());
+        assert!(wrapped.contains("'\"'\"'"), "the wrapper should escape quotes: {wrapped}");
+        assert_eq!(unwrap_for_display(&wrapped), guard);
+    }
+
+    #[test]
+    fn running_as_root_is_shown_as_sudo_without_the_flag_noise() {
+        let wrapped = wrap_command("systemctl reload nginx", Some("root"), &BTreeMap::new());
+        assert_eq!(unwrap_for_display(&wrapped), "sudo systemctl reload nginx");
+    }
+
+    #[test]
+    fn anything_it_cannot_unwrap_is_shown_exactly_as_it_runs() {
+        // Display only: an imperfect reversal must cost legibility, never correctness.
+        assert_eq!(unwrap_for_display("echo plain"), "echo plain");
+        assert_eq!(unwrap_for_display("bash -lc 'unterminated"), "bash -lc 'unterminated");
     }
 }
