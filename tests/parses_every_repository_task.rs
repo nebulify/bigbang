@@ -23,28 +23,42 @@ use bigbang::task::TaskDefinition;
 /// Panics rather than returning empty. The whole point of these tests is breadth, and breadth
 /// that can quietly become zero is not a guard.
 fn corpus() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")];
+    // Each root carries where it came from, so a failure blames the right thing. The first
+    // version of this message accused BIGBANG_TASK_CORPUS of naming a directory that had
+    // actually come from the bundled default.
+    let mut roots = vec![(
+        "the corpus shipped with this repository",
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"),
+    )];
     match std::env::var("BIGBANG_TASK_CORPUS").as_deref() {
         // An explicit opt-out, for somewhere there is genuinely nothing to point at. It still
         // leaves the bundled corpus, so it cannot reduce this to nothing.
         Ok("none") | Err(_) => {}
-        Ok(list) => roots.extend(list.split(':').filter(|p| !p.is_empty()).map(PathBuf::from)),
+        Ok(list) => roots.extend(
+            list.split(':')
+                .filter(|p| !p.is_empty())
+                .map(|p| ("BIGBANG_TASK_CORPUS", PathBuf::from(p))),
+        ),
     }
     // Kept so this still sweeps everything when the two repositories sit side by side.
     for sibling in ["../bigbang-library/tasks", "../src/main/resources/deployment/tasks"] {
         let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(sibling);
         if candidate.is_dir() {
-            roots.push(candidate);
+            roots.push(("a sibling checkout", candidate));
         }
     }
 
     // By file name, later roots winning: a corpus pointed at the library replaces the bundled
     // copy of the same definition rather than being counted beside it.
     let mut by_name: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
-    for root in &roots {
+    for (source, root) in &roots {
         if !root.is_dir() {
             panic!(
-                "BIGBANG_TASK_CORPUS names {}, which is not a directory",
+                "{source} gives {}, which is not a directory.\n\
+                 If that path looks stale, the test binary was built somewhere else: \
+                 CARGO_MANIFEST_DIR is baked in at compile time, so moving the checkout \
+                 leaves an old binary pointing at the old place until something forces a \
+                 rebuild.",
                 root.display()
             );
         }
@@ -62,7 +76,7 @@ fn corpus() -> Vec<PathBuf> {
         "no task definitions found in {:?}. tests/corpus/ ships with this repository, so an \
          empty result means it was deleted — these guards measure breadth and cannot pass \
          against nothing.",
-        roots
+        roots.iter().map(|(_, r)| r.display().to_string()).collect::<Vec<_>>()
     );
     files
 }
