@@ -74,10 +74,93 @@ pub struct SshTarget {
 pub struct SshExecutor {
     pub target: SshTarget,
     pub echo: bool,
+    /// A socket for ssh to multiplex over, when the recipe asked for one
+    /// session per host.
+    ///
+    /// `ControlMaster=auto` makes the first command open the connection and
+    /// every later one reuse it. Deliberately additive: if the master cannot be
+    /// created — an old ssh, a path too long for a unix socket, a filesystem
+    /// that will not hold one — ssh falls back to connecting normally, so the
+    /// recipe runs either way and only pays for it in time.
+    pub control_path: Option<String>,
     /// Values that must never reach a log. Resolved secrets get substituted into commands, so an
     /// echoed command line would otherwise print the database password into CI output — where it
     /// is retained, searchable, and readable by anyone who can see the run.
     pub secrets: Vec<String>,
+}
+
+/// Run a child with a deadline, killing it and everything it started if the deadline passes.
+///
+/// This was `Command::new("timeout")` — GNU coreutils, which is absent on macOS unless
+/// somebody installed it as `gtimeout`, and absent on Windows entirely. Shelling out to it
+/// meant bigbang itself only ran on Linux, which is a larger limitation than any script's.
+///
+/// The kill is sent to the process *group*, not just the child. `ssh` without that leaves the
+/// remote command running and the connection half-open: killing the local ssh does not tell
+/// the far side to stop, but closing the whole group does tear down the pipe that ssh is
+/// writing to, which is what makes the remote side notice. A plain `child.kill()` on the
+/// immediate process is what a read-side deadline would have done, and the original comment
+/// here was right to avoid it.
+fn run_with_deadline(mut cmd: Command, timeout_secs: u64) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
+    // Its own process group, so the kill reaches what the child started too.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawning the command")?;
+
+    // The pipes are drained on threads. Reading them in this loop instead would deadlock the
+    // moment a command produced more output than a pipe buffer holds, which a deploy that
+    // prints progress does immediately.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    let status = loop {
+        match child.try_wait().context("waiting for the command")? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    // SIGTERM to the group first, then SIGKILL if it is still there: a
+                    // remote shell given the chance to exit cleanly leaves less behind.
+                    let pid = child.id() as i32;
+                    unsafe { libc::killpg(pid, libc::SIGTERM) };
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if child.try_wait().ok().flatten().is_none() {
+                        unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    }
+                    break child.wait().context("reaping the command")?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
 }
 
 /// Replace every known secret with `***`.
@@ -109,6 +192,16 @@ impl SshExecutor {
             "-i".into(), self.target.key_path.clone(),
             "-p".into(), self.target.port.to_string(),
         ];
+        if let Some(path) = &self.control_path {
+            args.push("-o".into());
+            args.push("ControlMaster=auto".into());
+            args.push("-o".into());
+            args.push(format!("ControlPath={path}"));
+            // Long enough to cover the gap between two commands, short enough
+            // that an abandoned run does not leave a connection open for hours.
+            args.push("-o".into());
+            args.push("ControlPersist=30".into());
+        }
         if let Some(jump) = &self.target.jump {
             args.push("-J".into());
             args.push(jump.clone());
@@ -125,12 +218,10 @@ impl CommandExecutor for SshExecutor {
             println!("[SSH] -> {}@{}:{}", self.target.user, self.target.host, self.target.port);
             println!("$ {}", mask(command, &self.secrets));
         }
-        // `timeout` wraps ssh rather than being enforced in-process: it kills the whole child,
-        // including a remote command still producing output, which a read-side deadline would not.
-        let mut cmd = Command::new("timeout");
-        cmd.arg(timeout_secs.to_string()).arg("ssh").args(self.argv(command));
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.argv(command));
         cmd.stdin(Stdio::null());
-        let out = cmd.output().context("spawning ssh")?;
+        let out = run_with_deadline(cmd, timeout_secs).context("running ssh")?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         if self.echo && !text.is_empty() {
@@ -162,12 +253,12 @@ impl CommandExecutor for LocalExecutor {
             println!("[local]");
             println!("$ {}", mask(command, &self.secrets));
         }
-        // Same shape as the SSH path: `timeout` wraps the whole child rather than a read deadline,
-        // so a command that hangs is killed rather than leaving the process behind.
-        let mut cmd = Command::new("timeout");
-        cmd.arg(timeout_secs.to_string()).arg("sh").arg("-c").arg(command);
+        // Same shape as the SSH path: the deadline kills the whole process group, so a
+        // command that hangs is killed rather than left behind.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
         cmd.stdin(Stdio::null());
-        let out = cmd.output().context("spawning a local command")?;
+        let out = run_with_deadline(cmd, timeout_secs).context("running a local command")?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         if self.echo && !text.is_empty() {
@@ -752,6 +843,7 @@ mod tests {
             },
             echo: false,
             secrets: Vec::new(),
+            control_path: None,
         };
         let argv = ssh.argv("uptime");
         assert_eq!(argv[argv.len() - 2], "debian@10.1.1.75");
@@ -759,5 +851,86 @@ mod tests {
         assert!(argv.windows(2).any(|w| w[0] == "-J" && w[1] == "debian@57.129.31.14"));
         assert!(argv.windows(2).any(|w| w[0] == "-i" && w[1] == "/k/id"));
         assert!(argv.contains(&"StrictHostKeyChecking=no".to_string()));
+        // Without singleSession there is no multiplexing, and the flags are
+        // exactly what they always were.
+        assert!(!argv.iter().any(|a| a.starts_with("ControlPath")));
+    }
+
+    #[test]
+    fn a_single_session_recipe_multiplexes_over_one_connection() {
+        // What `singleSession: true` buys: one TCP connection and one key
+        // exchange per host instead of one per command. It does not change what
+        // runs — each command still gets its own shell — which is why it is
+        // safe to switch on for recipes that have been running without it.
+        let ssh = SshExecutor {
+            target: SshTarget {
+                host: "10.1.1.75".into(), port: 22, user: "debian".into(),
+                key_path: "/k/id".into(), jump: None,
+            },
+            echo: false,
+            secrets: Vec::new(),
+            control_path: Some("/tmp/bb-abc/s".into()),
+        };
+        let argv = ssh.argv("uptime");
+        assert!(argv.windows(2).any(|w| w[0] == "-o" && w[1] == "ControlMaster=auto"));
+        assert!(argv.windows(2).any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/bb-abc/s"));
+        assert!(argv.windows(2).any(|w| w[0] == "-o" && w[1] == "ControlPersist=30"));
+        // The command still comes last: multiplexing must not reorder argv.
+        assert_eq!(argv[argv.len() - 1], "uptime");
+        assert_eq!(argv[argv.len() - 2], "debian@10.1.1.75");
+    }
+
+    #[test]
+    fn a_command_that_finishes_returns_its_output_and_code() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf hello; printf oops >&2; exit 7");
+        let out = run_with_deadline(cmd, 10).expect("should run");
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
+    }
+
+    #[test]
+    fn a_command_that_hangs_is_killed_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let out = run_with_deadline(cmd, 1).expect("should return");
+        let waited = started.elapsed();
+        assert!(!out.status.success(), "a killed command must not look successful");
+        assert!(waited < std::time::Duration::from_secs(10), "waited {waited:?}");
+    }
+
+    #[test]
+    fn more_output_than_a_pipe_holds_does_not_deadlock() {
+        // Reading the pipes after waiting would hang here: a pipe buffer is 64 KB,
+        // and a deploy that prints progress passes that immediately.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("i=0; while [ $i -lt 20000 ]; do echo 'a line of output'; i=$((i+1)); done");
+        let out = run_with_deadline(cmd, 20).expect("should run");
+        assert!(out.status.success());
+        assert!(out.stdout.len() > 200_000, "got {} bytes", out.stdout.len());
+    }
+
+    #[test]
+    fn a_child_of_the_killed_command_does_not_survive_it() {
+        // The kill goes to the process group. Killing only the immediate child leaves
+        // whatever it started running — for ssh that is a remote command and a
+        // half-open connection.
+        let marker = std::env::temp_dir().join(format!("bb-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "sh -c 'sleep 3; touch {}' & wait",
+            marker.display()
+        );
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&script);
+        let _ = run_with_deadline(cmd, 1).expect("should return");
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "a grandchild outlived the deadline and finished its work"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }

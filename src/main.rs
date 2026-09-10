@@ -170,6 +170,24 @@ enum VaultOp {
         #[arg(long)]
         profile: String,
     },
+    /// Ask the operator to store an item, in a terminal this process cannot read.
+    ///
+    /// Writes a request that bgconsole picks up and opens a prompt for. Nothing comes back
+    /// here: the outcome is discovered by looking at the vault afterwards, because a reply
+    /// channel would be a way for the secret to return.
+    Request {
+        #[arg(long = "item-id")]
+        item_id: String,
+        #[arg(long = "type", default_value = "PASSWORD")]
+        type_: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// How long to wait for the operator, in seconds.
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
+        #[arg(long)]
+        profile: String,
+    },
     /// Add an item to the vault
     Add {
         #[arg(long = "item-id")]
@@ -185,8 +203,16 @@ enum VaultOp {
         #[arg(long)]
         replace: bool,
         /// Read the value from standard input.
-        #[arg(long, conflicts_with_all = ["data", "data_file"])]
+        #[arg(long, conflicts_with_all = ["data", "data_file", "prompt"])]
         stdin: bool,
+        /// Ask for the value on this terminal, without echoing it. Meant for a terminal the
+        /// operator owns — see `vault request`, which opens one.
+        #[arg(long, conflicts_with_all = ["data", "data_file", "stdin", "generate"])]
+        prompt: bool,
+        /// Read the prompted value as a block ending at Ctrl-D, for a private key or a
+        /// certificate. Without it a prompt takes one line.
+        #[arg(long, requires = "prompt")]
+        multiline: bool,
         /// Generate a random value and store it without ever displaying it.
         #[arg(long, conflicts_with_all = ["data", "data_file", "stdin"])]
         generate: bool,
@@ -329,11 +355,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             VaultOp::Status { profile } => vault_status(&profile),
             VaultOp::List { profile } => vault_list(&profile),
             VaultOp::Get { item_id, profile } => vault_get(&item_id, &profile),
+            VaultOp::Request { item_id, type_, description, timeout, profile } =>
+                vault_request(&item_id, &type_, description.as_deref(), timeout, &profile),
             VaultOp::Add {
-                item_id, data, data_file, stdin, replace, generate, length, min_length, max_length,
-                special, charset, comment, restriction, prepared_file, type_, description, profile,
+                item_id, data, data_file, stdin, prompt, multiline, replace, generate, length, min_length,
+                max_length, special, charset, comment, restriction, prepared_file, type_,
+                description, profile,
             } => vault_add(
-                &item_id, data.as_deref(), data_file.as_deref(), stdin, replace,
+                &item_id, data.as_deref(), data_file.as_deref(), stdin, prompt, multiline, replace,
                 GenerateOptions { generate, length, min_length, max_length, special,
                                   charset: charset.clone(), comment: comment.clone() },
                 &restriction, prepared_file.as_deref(),
@@ -816,11 +845,170 @@ struct GenerateOptions {
 /// A private key passed as --data sits in the process's argv, where anything else on the machine
 /// can read it out of `ps` for as long as the command runs. A file, stdin or generation costs
 /// nothing and closes that.
+/// Ask the operator for an item, then wait for the vault to receive it.
+///
+/// The waiting is the interesting part, and it is deliberately blunt. Nothing is written
+/// back to this process, so the only evidence the operator finished is the vault changing
+/// on disk. A v2 vault will not list its contents without the password — which is the
+/// property being paid for, not an obstacle to route around — so this watches the file
+/// rather than its contents. It learns that *something* was stored, never what.
+///
+/// The precise check is used where it is honestly available: a vault that does not exist
+/// yet, or a v1 vault whose names are in the clear.
+fn vault_request(
+    item_id: &str,
+    type_: &str,
+    description: Option<&str>,
+    timeout_secs: u64,
+    profile_ref: &str,
+) -> Result<()> {
+    use bigbang::request;
+
+    let profile = Profile::open(profile_ref)?;
+    let vault_root = std::path::PathBuf::from(Profile::expand(&profile.vault_path));
+
+    // Already present is a success, not an error: this is meant to be safe to call from a
+    // recipe that runs more than once.
+    if vault_holds(profile_ref, item_id) == Some(true) {
+        println!("✓ {item_id} is already in the vault");
+        return Ok(());
+    }
+
+    if !request::receiver_present() {
+        anyhow::bail!(
+            "no bgconsole is listening at {} — start bgconsole, or add the item directly with\n    bigbang vault add --prompt --profile {profile_ref} --item-id {item_id}",
+            request::request_dir().display()
+        );
+    }
+
+    let before = vault_fingerprint(&vault_root);
+    let path = request::ask_for_item(profile_ref, item_id, type_, description)?;
+    println!("→ asked for {item_id} in a terminal this process cannot read");
+
+    let found = request::wait_for(std::time::Duration::from_secs(timeout_secs), || {
+        match vault_holds(profile_ref, item_id) {
+            Some(present) => present,
+            // Encrypted listing: the change on disk is all this process may know.
+            None => vault_fingerprint(&vault_root) != before,
+        }
+    })?;
+
+    request::withdraw(&path);
+
+    if !found {
+        anyhow::bail!("{item_id} was not stored within {timeout_secs}s");
+    }
+    match vault_holds(profile_ref, item_id) {
+        Some(true) => println!("✓ {item_id} is in the vault"),
+        _ => println!(
+            "✓ the vault was written. Its contents are encrypted, so this process cannot \
+             confirm the item by name — the next command that uses it will."
+        ),
+    }
+    Ok(())
+}
+
+/// Whether the vault holds an item — `None` when that cannot be answered without the
+/// password, which is not a failure but the encryption working.
+fn vault_holds(profile_ref: &str, item_id: &str) -> Option<bool> {
+    use bigbang::vault::Format;
+    let vault = open_vault(profile_ref).ok()?;
+    match vault.format() {
+        Ok(Format::V2) => None,
+        Ok(_) => Some(
+            vault
+                .read_items_with(None)
+                .map(|items| items.iter().any(|i| i.name == item_id))
+                .unwrap_or(false),
+        ),
+        // No vault yet: nothing is in it.
+        Err(_) => Some(false),
+    }
+}
+
+/// A cheap signature of the vault on disk: how many files, their total size, and the newest
+/// modification time. Enough to notice that the operator stored something, and nothing more.
+fn vault_fingerprint(root: &std::path::Path) -> (usize, u64, u64) {
+    fn walk(dir: &std::path::Path, acc: &mut (usize, u64, u64)) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), acc);
+            } else {
+                acc.0 += 1;
+                acc.1 += meta.len();
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                acc.2 = acc.2.max(mtime);
+            }
+        }
+    }
+    let mut acc = (0usize, 0u64, 0u64);
+    walk(root, &mut acc);
+    acc
+}
+
+/// Read a multi-line value from the terminal with echo off.
+///
+/// Reads `/dev/tty` rather than standard input, so this keeps working when the process was
+/// started with its stdin redirected — which is the normal case for a command bgconsole
+/// typed into a shell. Echo is disabled around the read and restored afterwards, including
+/// on the error paths, because a terminal left with echo off looks broken and the operator
+/// has no way to know why.
+fn read_hidden_block(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("opening /dev/tty — a prompt needs a terminal")?;
+    let fd = tty.as_raw_fd();
+
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+        anyhow::bail!("reading the terminal settings");
+    }
+    let restore = term;
+    term.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        anyhow::bail!("turning the echo off — refusing to read a value that would be shown");
+    }
+
+    let mut out = std::io::stderr();
+    let _ = writeln!(out, "{prompt}");
+    let mut text = String::new();
+    let mut reader = BufReader::new(&tty);
+    let mut line = String::new();
+    let result = loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break Ok(()),
+            Ok(_) => text.push_str(&line),
+            Err(e) => break Err(e),
+        }
+    };
+
+    // Restored whichever way the loop ended.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &restore) };
+    let _ = writeln!(out);
+    result.context("reading the value")?;
+    Ok(text)
+}
+
 fn vault_add(
     item_id: &str,
     data: Option<&str>,
     data_file: Option<&std::path::Path>,
     stdin: bool,
+    prompt: bool,
+    multiline: bool,
     replace: bool,
     gen: GenerateOptions,
     restriction: &str,
@@ -855,7 +1043,45 @@ fn vault_add(
     }
     let mut public_key: Option<String> = None;
 
-    let value = match (data, data_file, stdin, gen.generate) {
+    // Asked for on the terminal, never echoed, and typed twice. The confirmation is not
+    // ceremony: a mistyped secret stores cleanly and fails later against whatever it was
+    // meant to authenticate to, with nothing pointing back here.
+    let prompted = if prompt {
+        if multiline {
+            // A private key cannot be typed on one line, and pasting one through a file
+            // would put it on the disk of the very machine the prompt exists to keep it off.
+            // So: read until end-of-input, echoing nothing, and confirm by shape rather than
+            // by asking for the whole thing twice — nobody re-pastes a 3 kB key correctly,
+            // and a confirmation people work around is worse than none.
+            let text = read_hidden_block(&format!(
+                "Paste the value for {item_id}, then press Ctrl-D on a blank line:"
+            ))?;
+            if text.trim().is_empty() {
+                anyhow::bail!("refusing to store an empty value");
+            }
+            println!(
+                "  read {} bytes over {} lines",
+                text.len(),
+                text.lines().count()
+            );
+            Some(text)
+        } else {
+            let first = rpassword::prompt_password(format!("Value for {item_id}: "))
+                .context("reading the value")?;
+            if first.is_empty() {
+                anyhow::bail!("refusing to store an empty value");
+            }
+            let again = rpassword::prompt_password("Type it again: ").unwrap_or_default();
+            if first != again {
+                anyhow::bail!("the two values did not match — nothing was stored");
+            }
+            Some(first)
+        }
+    } else {
+        None
+    };
+
+    let value = match (prompted.as_deref().or(data), data_file, stdin, gen.generate) {
         (Some(d), _, _, _) => d.to_string(),
         (_, Some(path), _, _) => std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?,
@@ -944,6 +1170,58 @@ fn vault_add(
     Ok(())
 }
 
+/// Where the ssh control sockets live for one run of one recipe.
+///
+/// Only created when the recipe asks for `singleSession`. The directory is
+/// removed when this value drops, which also removes the sockets — an ssh
+/// master whose socket is gone exits on its own, so an abandoned run does not
+/// leave a connection open.
+///
+/// Kept short (`/tmp/bb-<pid>`) on purpose: a unix socket path has about a
+/// hundred bytes to work with, and a long one fails at connect time rather than
+/// anywhere informative.
+struct Sessions {
+    dir: Option<PathBuf>,
+}
+
+impl Sessions {
+    fn new(enabled: bool) -> Self {
+        if !enabled {
+            return Sessions { dir: None };
+        }
+        let dir = std::env::temp_dir().join(format!("bb-{}", std::process::id()));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => Sessions { dir: Some(dir) },
+            Err(e) => {
+                // Not fatal: without a socket every command opens its own
+                // connection, which is what it did before this existed.
+                eprintln!("bigbang: no shared ssh session ({e}); connecting per command");
+                Sessions { dir: None }
+            }
+        }
+    }
+
+    fn path_for(&self, host: &str) -> Option<String> {
+        let dir = self.dir.as_ref()?;
+        // One socket per host, named by a hash so the length is bounded
+        // whatever the instance is called.
+        let mut h: u64 = 1469598103934665603;
+        for b in host.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        Some(dir.join(format!("{h:x}")).to_string_lossy().into_owned())
+    }
+}
+
+impl Drop for Sessions {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -> Result<()> {
     use bigbang::exec::{run_definition_with, CommandExecutor, LocalExecutor, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
@@ -983,20 +1261,151 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
     let instances = load_instances(&store)?;
     let library_root = PathBuf::from(Profile::expand(&profile.library_path));
 
-    let mut failures = 0usize;
-    let mut targeted = 0usize;
+    // Resolve every role first, and refuse before running anything.
+    //
+    // Two separate refusals, both of which used to be silent. A role declaring
+    // something this code does not implement is a promise that reads as kept.
+    // A role matching no machine used to print a line and let the recipe report
+    // success — and because a single host tagged with every role makes every
+    // selector correct, that only bites once the topology splits.
+    let mut plan: Vec<(&bigbang::recipe::Role, Vec<_>)> = Vec::new();
+    let mut complaints: Vec<String> = Vec::new();
+    let unhonoured = bigbang::recipe::unhonoured_recipe_fields(&recipe);
+    if !unhonoured.is_empty() {
+        complaints.push(format!(
+            "this recipe declares {} — nothing here implements that",
+            unhonoured.join(", ")
+        ));
+    }
     for role in &recipe.roles {
+        let unhonoured = bigbang::recipe::unhonoured_role_fields(role);
+        if !unhonoured.is_empty() {
+            complaints.push(format!(
+                "role '{}' declares {} this version does not implement",
+                role.name,
+                unhonoured.join(", ")
+            ));
+        }
         let targets = resolve_role_targets(
             &instances,
             &recipe.project_id,
             role.infrastructure_ids.as_ref(),
             role.selectors.as_ref(),
         );
+        if let Some(why) = bigbang::recipe::role_shortfall(role, targets.len()) {
+            let how = match (&role.infrastructure_ids, &role.selectors) {
+                (Some(ids), _) if !ids.is_empty() => format!("ids {}", ids.join(", ")),
+                (_, Some(sel)) if !sel.is_empty() => format!("selectors {}", sel.join(", ")),
+                _ => "no selector at all".to_string(),
+            };
+            complaints.push(format!("role '{}' {why} — matching on {how}", role.name));
+        }
+        plan.push((role, targets));
+    }
+
+    println!();
+    println!("Plan:");
+    for (role, targets) in &plan {
+        let want = match role.count {
+            Some(n) => format!("expects {n}"),
+            None => "expects ≥1".to_string(),
+        };
+        println!(
+            "  role '{}' → {} instance(s) ({want})",
+            role.name,
+            targets.len()
+        );
+        for t in targets.iter() {
+            println!("      {}", t.name);
+        }
+    }
+
+    // Prerequisites are checked on every machine the recipe targets, before any
+    // of them is touched. Checking them per host as its turn came would mean
+    // the first host is already changed when the second fails its check, which
+    // is the half-deployed state the checks exist to avoid.
+    let sessions = Sessions::new(recipe.single_session);
+    if dry_run && !recipe.prerequisites.is_empty() {
+        // A prerequisite is an arbitrary command from the recipe. Running it
+        // would make --dry-run something that executes, which is the one thing
+        // it promises not to be. Say they were skipped rather than let a clean
+        // dry run imply they passed.
+        println!();
+        println!(
+            "Prerequisites: {} not checked — a dry run does not execute them",
+            recipe.prerequisites.len()
+        );
+        for p in &recipe.prerequisites {
+            println!("  ⊘ {}", p.check);
+        }
+    }
+    if !recipe.prerequisites.is_empty() && complaints.is_empty() && !dry_run {
+        let mut seen: Vec<String> = Vec::new();
+        println!();
+        println!("Prerequisites:");
+        for (_, targets) in &plan {
+            for instance in targets {
+                if seen.contains(&instance.name) {
+                    continue;
+                }
+                seen.push(instance.name.clone());
+                // Declared out here so the temporary key file lives as long as the
+                // executor that names it. Bound inside the branch, it would be
+                // deleted the moment the branch ended and every check would fail
+                // to authenticate.
+                let _key_guard;
+                let mut probe: Box<dyn CommandExecutor> = if instance.is_local() {
+                    Box::new(LocalExecutor { echo: false, secrets: Vec::new() })
+                } else {
+                    let key_id = instance.ssh_key_id.as_deref().with_context(|| {
+                        format!("no sshKeyId on instance {}", instance.name)
+                    })?;
+                    let key = resolve_ssh_key(key_id, &vault_root, &password)?;
+                    let target =
+                        ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
+                    let ex = SshExecutor {
+                        target,
+                        echo: false,
+                        secrets: Vec::new(),
+                        control_path: sessions.path_for(&instance.name),
+                    };
+                    _key_guard = key;
+                    Box::new(ex)
+                };
+                for p in &recipe.prerequisites {
+                    let result = probe.run(&p.command, 60)?;
+                    let ok = result.exit_code == 0;
+                    println!(
+                        "  {} {} — {}",
+                        if ok { "✓" } else { "✗" },
+                        instance.name,
+                        p.check
+                    );
+                    if !ok {
+                        complaints.push(p.complaint(&instance.name));
+                    }
+                }
+            }
+        }
+    }
+
+    if !complaints.is_empty() {
+        println!();
+        for c in &complaints {
+            println!("  ✗ {c}");
+        }
+        anyhow::bail!(
+            "this recipe cannot run here — nothing was run.\n    A role matching the wrong number of machines means the inventory is missing\n    something or a selector is wrong; a role that may genuinely be absent should\n    say so with \"count\": 0.\n    A failed prerequisite means the machine is not ready, and the recipe said so\n    rather than finding out halfway."
+        );
+    }
+
+    let mut failures = 0usize;
+    let mut targeted = 0usize;
+    for (role, targets) in plan {
         println!();
         println!("── role '{}' → {} instance(s)", role.name, targets.len());
         targeted += targets.len();
         if targets.is_empty() {
-            println!("   (no instance matches; nothing to do)");
             continue;
         }
 
@@ -1069,7 +1478,12 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                     let key = resolve_ssh_key(key_id, &vault_root, &password)?;
                     let target = ssh_target_for(instance, &instances, &key.path.to_string_lossy(), None)?;
                     _key_guard = key; // keep the temporary key file alive for the whole run
-                    Box::new(SshExecutor { target, echo: true, secrets })
+                    Box::new(SshExecutor {
+                        target,
+                        echo: true,
+                        secrets,
+                        control_path: sessions.path_for(&instance.name),
+                    })
                 };
 
                 // Functions need more than a shell: where templates live, and a vault to write to.

@@ -41,6 +41,9 @@ ssh-key = { version = "0.6.7", features = ["ed25519", "alloc", "getrandom"] }
 chacha20poly1305 = "0.11.0"
 argon2 = "0.6.0"
 rpassword = "7.5.4"
+# Only for turning terminal echo off around a multi-line prompt; already in the tree
+# beneath rpassword, so this makes an existing dependency explicit rather than adding one.
+libc = "0.2"
 
 [profile.release]
 lto = true

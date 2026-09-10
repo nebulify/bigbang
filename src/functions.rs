@@ -49,6 +49,7 @@ pub fn run_function(
     }
     match function.function.as_str() {
         "uploadTemplate" => upload_template(function, variables, run_as, ctx, executor),
+        "uploadFile" => upload_file(function, variables, run_as, ctx, executor),
         "vaultAddItem" => vault_add_item(function, variables, ctx),
         "registerInstance" => register_instance(function, variables, ctx),
         "deregisterInstance" => deregister_instance(function, variables, ctx),
@@ -111,6 +112,107 @@ fn upload_template(
             result.output.trim()
         );
     }
+    if let Some(name) = &function.output_variable {
+        variables.insert(name.clone(), remote_path);
+    }
+    Ok(())
+}
+
+/// Place a file on the host byte for byte.
+///
+/// `uploadTemplate` reads its source as UTF-8 text and substitutes `${name}` in
+/// it, which is right for a config file and wrong for everything else: a
+/// gzipped archive is not valid UTF-8, so the read fails before anything is
+/// sent. The nebulify site deploy uploaded its tarball that way and could never
+/// have worked — the failure was waiting for the first real run.
+///
+/// So this is a separate function rather than a flag. A template is text you
+/// want rendered; a file is bytes you want unchanged, and deciding which by
+/// sniffing the content is how you get a binary that was silently rewritten.
+fn upload_file(
+    function: &Function,
+    variables: &mut BTreeMap<String, String>,
+    run_as: Option<&str>,
+    ctx: &FunctionContext,
+    executor: &mut dyn CommandExecutor,
+) -> Result<()> {
+    let path = function
+        .param("path", variables)
+        .or_else(|| function.param("templatePath", variables))
+        .context("uploadFile needs 'path'")?;
+    let remote_path = function
+        .param("remotePath", variables)
+        .context("uploadFile needs 'remotePath'")?;
+    let mode = function.param("mode", variables).unwrap_or_else(|| "0644".to_string());
+
+    let source = resolve_template(&ctx.resources_root, &path)?;
+    let bytes = std::fs::read(&source)
+        .with_context(|| format!("reading {}", source.display()))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    let parent = Path::new(&remote_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_string());
+
+    if ctx.echo {
+        println!(
+            "[fn] uploading {} -> {remote_path} ({} bytes, mode {mode})",
+            source.display(),
+            bytes.len()
+        );
+    }
+
+    // Sent in chunks, because the payload travels as one argument and Linux
+    // caps a single argument at MAX_ARG_STRLEN — 128 KB, independently of the
+    // much larger total ARG_MAX. Measured: 256 KB per chunk fails with
+    // "Argument list too long", from a layer that knows nothing about uploads.
+    // 64 KB leaves room for the wrapper around it.
+    //
+    // Written to a temporary name and moved into place at the end, so an upload
+    // cut halfway leaves nothing that looks like a complete file.
+    const CHUNK: usize = 64 * 1024;
+    let staging = format!("{remote_path}.part");
+    let mut first = true;
+    for piece in encoded.as_bytes().chunks(CHUNK) {
+        let piece = std::str::from_utf8(piece).expect("base64 is ascii");
+        let redirect = if first { ">" } else { ">>" };
+        let script = if first {
+            format!("mkdir -p '{parent}' && printf '%s' '{piece}' {redirect} '{staging}.b64'")
+        } else {
+            format!("printf '%s' '{piece}' {redirect} '{staging}.b64'")
+        };
+        let result = executor.run(&wrap_command(&script, run_as, variables), 300)?;
+        if !result.success() {
+            bail!(
+                "uploading {} to {remote_path} failed while sending (exit {}): {}",
+                source.display(),
+                result.exit_code,
+                result.output.trim()
+            );
+        }
+        first = false;
+    }
+
+    // Decode, check the size is what was sent, and only then take the name.
+    // A truncated transfer that still decoded would otherwise be published.
+    let finish = format!(
+        "base64 -d < '{staging}.b64' > '{staging}' && rm -f '{staging}.b64' && \
+         size=$(wc -c < '{staging}') && [ \"$size\" -eq {} ] && \
+         chmod {mode} '{staging}' && mv -f '{staging}' '{remote_path}'",
+        bytes.len()
+    );
+    let result = executor.run(&wrap_command(&finish, run_as, variables), 300)?;
+    if !result.success() {
+        bail!(
+            "uploading {} to {remote_path} failed on the far side (exit {}): {}",
+            source.display(),
+            result.exit_code,
+            result.output.trim()
+        );
+    }
+
     if let Some(name) = &function.output_variable {
         variables.insert(name.clone(), remote_path);
     }
@@ -610,5 +712,172 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("vault"), "{text}");
+    }
+
+    /// A local shell, so the upload can be checked by looking at the file it
+    /// produced rather than at the commands it claims to have sent.
+    struct RealShell;
+    impl CommandExecutor for RealShell {
+        fn run(&mut self, command: &str, _t: u64) -> Result<CommandResult> {
+            let out = std::process::Command::new("sh").arg("-c").arg(command).output()?;
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok(CommandResult { exit_code: out.status.code().unwrap_or(-1), output: text })
+        }
+    }
+
+    fn upload_file_fn(path: &str, remote: &str) -> Function {
+        let mut params = BTreeMap::new();
+        params.insert("path".into(), path.to_string());
+        params.insert("remotePath".into(), remote.to_string());
+        params.insert("mode".into(), "0644".into());
+        Function {
+            function: "uploadFile".into(),
+            name: Some("Upload".into()),
+            description: None,
+            params,
+            output_variable: None,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bb-upload-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_binary_file_arrives_byte_for_byte() {
+        // The bug this exists for: uploadTemplate reads its source as UTF-8, so
+        // a gzip fails before a single byte is sent. Every byte value appears
+        // here, including the 0x8b that broke the site tarball.
+        let root = scratch("binary");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        std::fs::write(root.join("blob.bin"), &payload).unwrap();
+        let remote = root.join("out.bin");
+
+        let f = upload_file_fn("blob.bin", remote.to_str().unwrap());
+        let mut vars = BTreeMap::new();
+        run_function(&f, &mut vars, None, &ctx(&root), &mut RealShell).expect("upload");
+
+        assert_eq!(std::fs::read(&remote).unwrap(), payload, "the bytes changed in transit");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_payload_larger_than_one_command_line_still_arrives() {
+        // Sent in chunks because the base64 travels as an ssh argument. A real
+        // site with images is megabytes; the failure without chunking is
+        // "Argument list too long", from a layer that knows nothing of uploads.
+        let root = scratch("large");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(900_000).collect();
+        std::fs::write(root.join("big.bin"), &payload).unwrap();
+        let remote = root.join("big-out.bin");
+
+        let f = upload_file_fn("big.bin", remote.to_str().unwrap());
+        let mut vars = BTreeMap::new();
+        run_function(&f, &mut vars, None, &ctx(&root), &mut RealShell).expect("upload");
+
+        let arrived = std::fs::read(&remote).unwrap();
+        assert_eq!(arrived.len(), payload.len());
+        assert_eq!(arrived, payload);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dollar_sequence_in_a_file_is_not_substituted() {
+        // The other half of the split: a template is rendered, a file is not.
+        // A shell script or a config full of ${...} uploaded as a file must
+        // arrive with them intact.
+        let root = scratch("dollars");
+        let text = b"echo ${site_root} and ${release}\n";
+        std::fs::write(root.join("script.sh"), text).unwrap();
+        let remote = root.join("script-out.sh");
+
+        let f = upload_file_fn("script.sh", remote.to_str().unwrap());
+        let mut vars = BTreeMap::new();
+        vars.insert("site_root".to_string(), "/var/www".to_string());
+        run_function(&f, &mut vars, None, &ctx(&root), &mut RealShell).expect("upload");
+
+        assert_eq!(std::fs::read(&remote).unwrap(), text.to_vec());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nothing_is_left_at_the_target_name_when_the_transfer_is_cut() {
+        // A half-written file that still decodes would be published as if it
+        // were the site. The staging name is what makes that impossible.
+        let root = scratch("cut");
+        std::fs::write(root.join("blob.bin"), vec![7u8; 4096]).unwrap();
+        let remote = root.join("never.bin");
+
+        let f = upload_file_fn("blob.bin", remote.to_str().unwrap());
+        let mut vars = BTreeMap::new();
+        // A recorder that fails every command: nothing reaches the far side.
+        let mut broken = Recorder { seen: Vec::new(), code: 1 };
+        let err = run_function(&f, &mut vars, None, &ctx(&root), &mut broken).unwrap_err();
+        assert!(format!("{err:#}").contains("failed"), "{err:#}");
+        assert!(!remote.exists(), "a failed upload must leave no file at the target name");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A shell that quietly loses one chunk, as a dropped connection would.
+    struct LossyShell {
+        drop_after: usize,
+        appends: usize,
+    }
+    impl CommandExecutor for LossyShell {
+        fn run(&mut self, command: &str, _t: u64) -> Result<CommandResult> {
+            if command.contains(">> ") {
+                self.appends += 1;
+                if self.appends > self.drop_after {
+                    // Reports success having written nothing — the shape of a
+                    // transfer that died without saying so.
+                    return Ok(CommandResult { exit_code: 0, output: String::new() });
+                }
+            }
+            let out = std::process::Command::new("sh").arg("-c").arg(command).output()?;
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok(CommandResult { exit_code: out.status.code().unwrap_or(-1), output: text })
+        }
+    }
+
+    #[test]
+    fn a_transfer_that_lost_a_chunk_is_refused_rather_than_published() {
+        // The chunks are a multiple of four bytes, so a truncated payload is
+        // still *valid* base64 and decodes without complaint. Only the length
+        // check notices — which is why the length check exists, and why a
+        // shorter file must never reach the target name.
+        let root = scratch("lossy");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
+        std::fs::write(root.join("blob.bin"), &payload).unwrap();
+        let remote = root.join("truncated.bin");
+
+        let f = upload_file_fn("blob.bin", remote.to_str().unwrap());
+        let mut vars = BTreeMap::new();
+        let mut lossy = LossyShell { drop_after: 1, appends: 0 };
+        let err = run_function(&f, &mut vars, None, &ctx(&root), &mut lossy)
+            .expect_err("a short file must not be accepted");
+        assert!(format!("{err:#}").contains("far side"), "{err:#}");
+        assert!(!remote.exists(), "a truncated upload was published");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_function_is_still_refused_rather_than_skipped() {
+        let root = scratch("unknown");
+        let mut params = BTreeMap::new();
+        params.insert("path".into(), "x".to_string());
+        let f = Function {
+            function: "uploadWhatever".into(),
+            name: None, description: None, params, output_variable: None,
+        };
+        let mut vars = BTreeMap::new();
+        let err = run_function(&f, &mut vars, None, &ctx(&root), &mut Recorder { seen: vec![], code: 0 })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("uploadWhatever"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

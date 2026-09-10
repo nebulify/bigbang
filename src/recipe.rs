@@ -155,11 +155,82 @@ pub struct Recipe {
     pub variables: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub roles: Vec<Role>,
+    /// Conditions each target machine must satisfy before anything is changed.
+    ///
+    /// Checked on every host the recipe targets, and the whole run refuses if
+    /// any of them fails. Declared in one recipe here for two years and never
+    /// once evaluated — a check that cannot fail, written by someone who
+    /// believed it was guarding a deployment.
+    #[serde(default)]
+    pub prerequisites: Vec<Prerequisite>,
+    /// Reuse one ssh connection per host for the whole recipe.
+    ///
+    /// Every command otherwise pays a fresh TCP connection and key exchange;
+    /// the restore drill runs dozens. This changes nothing about *what* runs or
+    /// in what order — each command still gets its own shell, so a `cd` still
+    /// does not carry to the next one.
+    #[serde(rename = "singleSession", default)]
+    pub single_session: bool,
+    /// Carried so they are not mistaken for fields nothing implements: the
+    /// discriminator, the library coordinates and the store's own timestamps.
+    ///
+    /// `environment` is deliberately *not* here. It is in the schema and
+    /// nothing reads it, so a recipe that sets one should be refused rather
+    /// than quietly ignored — which is the whole point of the bucket below.
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
+    #[serde(rename = "createdAt", default)]
+    pub created_at: Option<serde_json::Value>,
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<serde_json::Value>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Anything else the recipe declared. See `Role::extra`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A condition a machine must satisfy before a recipe touches it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Prerequisite {
+    /// What is being checked, for the operator to read.
+    pub check: String,
+    /// A shell command; a zero exit means the condition holds.
+    pub command: String,
+    /// What to say when it does not.
+    #[serde(rename = "failureMessage", default)]
+    pub failure_message: Option<String>,
+}
+
+impl Prerequisite {
+    pub fn complaint(&self, host: &str) -> String {
+        match &self.failure_message {
+            Some(m) if !m.trim().is_empty() => format!("{host}: {m}"),
+            _ => format!("{host}: {}", self.check),
+        }
+    }
+}
+
+/// The recipe-level fields this version does not implement.
+pub fn unhonoured_recipe_fields(recipe: &Recipe) -> Vec<String> {
+    recipe
+        .extra
+        .iter()
+        .filter(|(_, v)| !is_empty_declaration(v))
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Role {
     pub name: String,
+    /// Documentation only; carried so it is not mistaken for an unknown field.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub selectors: Option<Vec<String>>,
     #[serde(rename = "infrastructureIds", default)]
@@ -168,6 +239,68 @@ pub struct Role {
     pub variables: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub items: Vec<RoleItem>,
+    /// How many machines this role expects.
+    ///
+    /// This is the half of the inventory that belongs in the repository. Which
+    /// host answers to `database-server` is the operator's business and lives
+    /// in their profile; that there is *exactly one* of it is a property of the
+    /// architecture, and it travels with the code.
+    ///
+    /// Absent means "at least one". Present means exactly that many, which is
+    /// what makes it worth writing: a migration role that quietly matched two
+    /// databases would run the migration twice.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Anything the recipe declared that this code does not implement.
+    ///
+    /// Kept rather than dropped. Three recipe fields were being discarded in
+    /// silence here — `count` among them, written by someone who reasonably
+    /// assumed it did something — and a declaration that is ignored is worse
+    /// than one that is refused, because it reads as enforced.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Whether a role's matched machines are what the recipe said to expect.
+///
+/// Returns the complaint, or `None` when the role is satisfied.
+///
+/// Zero is always wrong. A role that matches no machine used to be skipped with
+/// the recipe still reporting success — so a mistyped selector, or an inventory
+/// that had not been imported, produced a deployment that deployed nothing and
+/// said it was fine. On a single host tagged with every role this cannot
+/// happen, which is exactly why it survived: the failure only appears when the
+/// topology splits, which is the day you are least able to absorb it.
+pub fn role_shortfall(role: &Role, matched: usize) -> Option<String> {
+    match role.count {
+        Some(want) if matched != want => Some(format!(
+            "expects {want} machine(s), matched {matched}"
+        )),
+        None if matched == 0 => Some("expects at least one machine, matched none".to_string()),
+        _ => None,
+    }
+}
+
+/// The fields a role declared that nothing here implements.
+pub fn unhonoured_role_fields(role: &Role) -> Vec<String> {
+    role.extra
+        .iter()
+        // An empty declaration asks for nothing, and generated recipes carry
+        // placeholders. Only a field with something in it is a broken promise.
+        .filter(|(_, v)| !is_empty_declaration(v))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+fn is_empty_declaration(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Bool(b) => !b,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -497,5 +630,156 @@ mod value_tests {
         let out = resolve_all(&vars, "/v", &no_password, &overrides).unwrap();
         assert_eq!(out.values["x"], "from-flag");
         std::env::remove_var("BIGBANG_VAR_X");
+    }
+
+    fn recipe(json: serde_json::Value) -> Recipe {
+        serde_json::from_value(json).expect("a recipe")
+    }
+
+    #[test]
+    fn the_fields_real_recipes_use_at_the_top_level_are_all_understood() {
+        // Every key present across the 28 recipes on this machine. `type` in
+        // particular: it landed in the unknown bucket at first and refused
+        // every recipe there is, because the struct never named it.
+        let r = recipe(serde_json::json!({
+            "type": "blaster:recipe",
+            "id": "r", "name": "R", "projectId": "p",
+            "group": "com.example", "version": "1.0",
+            "description": "what it does",
+            "variables": {"a": "b"},
+            "singleSession": true,
+            "createdAt": "2026-01-01", "updatedAt": "2026-01-02",
+            "prerequisites": [{"check": "c", "command": "true"}],
+            "roles": []
+        }));
+        assert!(unhonoured_recipe_fields(&r).is_empty(), "not understood: {:?}", r.extra);
+        assert!(r.single_session);
+        assert_eq!(r.prerequisites.len(), 1);
+    }
+
+    #[test]
+    fn single_session_is_read_rather_than_dropped() {
+        // Sixteen recipes declared it and it did nothing.
+        assert!(recipe(serde_json::json!({
+            "id": "r", "name": "R", "projectId": "p", "roles": [], "singleSession": true
+        })).single_session);
+        assert!(!recipe(serde_json::json!({
+            "id": "r", "name": "R", "projectId": "p", "roles": []
+        })).single_session);
+    }
+
+    #[test]
+    fn a_prerequisite_says_which_machine_and_why() {
+        let r = recipe(serde_json::json!({
+            "id": "r", "name": "R", "projectId": "p", "roles": [],
+            "prerequisites": [
+                {"check": "Debian or Ubuntu", "command": "grep -q debian /etc/os-release",
+                 "failureMessage": "This recipe requires Debian or Ubuntu"},
+                {"check": "Has a shell", "command": "test -x /bin/sh"}
+            ]
+        }));
+        assert_eq!(
+            r.prerequisites[0].complaint("vps-1"),
+            "vps-1: This recipe requires Debian or Ubuntu"
+        );
+        // No message written: the check text is better than nothing, and far
+        // better than a bare non-zero exit code.
+        assert_eq!(r.prerequisites[1].complaint("vps-1"), "vps-1: Has a shell");
+    }
+
+    #[test]
+    fn a_recipe_level_field_nothing_implements_is_named() {
+        // `environment` is in the schema and nothing reads it, so a recipe
+        // setting one must be refused rather than quietly ignored.
+        let r = recipe(serde_json::json!({
+            "id": "r", "name": "R", "projectId": "p", "roles": [],
+            "environment": {"KEY": "value"}
+        }));
+        assert_eq!(unhonoured_recipe_fields(&r), vec!["environment".to_string()]);
+    }
+
+    fn role(json: serde_json::Value) -> Role {
+        serde_json::from_value(json).expect("a role")
+    }
+
+    #[test]
+    fn a_role_matching_no_machine_is_a_refusal_not_a_shrug() {
+        // This is the whole point. It used to print "nothing to do" and let the
+        // recipe report success, so a mistyped selector deployed nothing and
+        // said it was fine.
+        let r = role(serde_json::json!({"name": "database-server"}));
+        assert!(role_shortfall(&r, 0).is_some());
+        assert!(role_shortfall(&r, 1).is_none());
+        assert!(role_shortfall(&r, 3).is_none(), "without a count, more is allowed");
+    }
+
+    #[test]
+    fn a_declared_count_must_be_matched_exactly() {
+        // A migration role that quietly matched two databases would run the
+        // migration twice, which is why exact is worth more than "at least".
+        let r = role(serde_json::json!({"name": "database-server", "count": 1}));
+        assert!(role_shortfall(&r, 1).is_none());
+        assert!(role_shortfall(&r, 0).is_some());
+        let two = role_shortfall(&r, 2).expect("two machines for a role expecting one");
+        assert!(two.contains('1') && two.contains('2'), "say both numbers: {two}");
+    }
+
+    #[test]
+    fn a_role_may_declare_that_it_is_optional() {
+        // The explicit escape, so "no machines" can be a deliberate state
+        // rather than only ever an accident.
+        let r = role(serde_json::json!({"name": "load-balancer", "count": 0}));
+        assert!(role_shortfall(&r, 0).is_none());
+        assert!(role_shortfall(&r, 1).is_some());
+    }
+
+    #[test]
+    fn count_is_read_rather_than_dropped() {
+        // It was in real recipes for months, doing nothing, because serde
+        // discards what the struct does not name.
+        let r = role(serde_json::json!({"name": "db", "count": 2}));
+        assert_eq!(r.count, Some(2));
+        assert!(r.extra.is_empty(), "count must not land in the unknown bucket");
+    }
+
+    #[test]
+    fn a_role_field_nothing_implements_is_named_rather_than_ignored() {
+        let r = role(serde_json::json!({
+            "name": "app",
+            "autoscale": {"min": 2, "max": 9}
+        }));
+        assert_eq!(unhonoured_role_fields(&r), vec!["autoscale".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_declaration_asks_for_nothing_and_does_not_block_a_run() {
+        // Generated recipes carry placeholders; refusing on those would make
+        // the guard something people route around.
+        let r = role(serde_json::json!({
+            "name": "app",
+            "autoscale": [],
+            "notes": "",
+            "enabled": false,
+            "extras": {}
+        }));
+        assert!(unhonoured_role_fields(&r).is_empty());
+    }
+
+    #[test]
+    fn the_fields_real_recipes_use_are_all_understood() {
+        // The keys actually present across the recipes on this machine. If one
+        // of these ever lands in `extra`, it is being silently discarded.
+        let r = role(serde_json::json!({
+            "name": "database-server",
+            "description": "the database",
+            "selectors": ["database-server"],
+            "infrastructureIds": ["vps-1"],
+            "variables": {"db_name": "dining"},
+            "count": 1,
+            "items": [{"task": "g/n/1.0", "order": 1}]
+        }));
+        assert!(r.extra.is_empty(), "not understood: {:?}", r.extra.keys().collect::<Vec<_>>());
+        assert_eq!(r.count, Some(1));
+        assert_eq!(r.items.len(), 1);
     }
 }

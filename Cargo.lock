@@ -184,6 +184,7 @@ dependencies = [
  "clap",
  "hmac",
  "jsonschema",
+ "libc",
  "pbkdf2",
  "rand",
  "regex",

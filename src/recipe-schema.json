@@ -4,7 +4,13 @@
   "title": "Recipe",
   "description": "Schema for project-specific recipes that orchestrate tasks and packages across infrastructure roles. Recipes bind infrastructure instances from RepoDB to reusable tasks/packages from the Library.",
   "type": "object",
-  "required": ["type", "id", "name", "projectId", "roles"],
+  "required": [
+    "type",
+    "id",
+    "name",
+    "projectId",
+    "roles"
+  ],
   "properties": {
     "type": {
       "type": "string",
@@ -15,7 +21,11 @@
       "type": "string",
       "description": "Unique identifier for this recipe (human-readable)",
       "minLength": 1,
-      "examples": ["k8s-cluster-prod", "database-ha-setup", "monitoring-stack"]
+      "examples": [
+        "k8s-cluster-prod",
+        "database-ha-setup",
+        "monitoring-stack"
+      ]
     },
     "name": {
       "type": "string",
@@ -55,7 +65,9 @@
     "environment": {
       "type": "object",
       "description": "Global environment variables for all roles",
-      "additionalProperties": { "type": "string" }
+      "additionalProperties": {
+        "type": "string"
+      }
     },
     "singleSession": {
       "type": "boolean",
@@ -79,20 +91,43 @@
       "type": "string",
       "format": "date-time",
       "description": "Timestamp when the recipe was last updated"
+    },
+    "prerequisites": {
+      "type": "array",
+      "description": "Conditions every targeted machine must satisfy before the recipe changes anything. Each command runs on the target; a zero exit means the condition holds. A failure refuses the whole run, on the reasoning that a half-deployed host is worse than an undeployed one.",
+      "items": {
+        "$ref": "#/definitions/prerequisite"
+      }
+    },
+    "group": {
+      "type": "string",
+      "description": "Library coordinate group for this recipe."
+    },
+    "version": {
+      "type": "string",
+      "description": "Version of this recipe."
     }
   },
   "definitions": {
     "role": {
       "type": "object",
       "description": "A role definition mapping infrastructure instances to tasks/packages",
-      "required": ["name"],
+      "required": [
+        "name"
+      ],
       "properties": {
         "name": {
           "type": "string",
           "description": "Name of the role (e.g., 'master', 'worker', 'load-balancer')",
           "minLength": 1,
           "maxLength": 50,
-          "examples": ["master", "worker", "slave", "gateway", "load-balancer"]
+          "examples": [
+            "master",
+            "worker",
+            "slave",
+            "gateway",
+            "load-balancer"
+          ]
         },
         "description": {
           "type": "string",
@@ -107,18 +142,32 @@
             "minLength": 1
           },
           "examples": [
-            ["k8s-master-1"],
-            ["k8s-worker-1", "k8s-worker-2"],
-            ["load-balancer-1"]
+            [
+              "k8s-master-1"
+            ],
+            [
+              "k8s-worker-1",
+              "k8s-worker-2"
+            ],
+            [
+              "load-balancer-1"
+            ]
           ]
         },
         "selectors": {
           "type": "array",
           "description": "Alternative: select infrastructure by selectors instead of specific IDs",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "examples": [
-            ["kubernetes-master"],
-            ["kubernetes-worker", "production"]
+            [
+              "kubernetes-master"
+            ],
+            [
+              "kubernetes-worker",
+              "production"
+            ]
           ]
         },
         "variables": {
@@ -129,7 +178,9 @@
         "environment": {
           "type": "object",
           "description": "Role-specific environment variables",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "items": {
           "type": "array",
@@ -138,19 +189,36 @@
           "items": {
             "$ref": "#/definitions/recipeItem"
           }
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many machines this role expects. Omitted means at least one; a number means exactly that many, and the run refuses when the inventory disagrees. This is the half of the inventory that belongs in the repository: which host answers to a role is the operator business, how many there should be is the architecture.",
+          "examples": [
+            1,
+            2,
+            3
+          ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "recipeItem": {
       "oneOf": [
-        { "$ref": "#/definitions/recipeTask" },
-        { "$ref": "#/definitions/recipePackage" }
+        {
+          "$ref": "#/definitions/recipeTask"
+        },
+        {
+          "$ref": "#/definitions/recipePackage"
+        }
       ]
     },
     "recipeTask": {
       "type": "object",
       "description": "Reference to a task from the Library to execute",
-      "required": ["task"],
+      "required": [
+        "task"
+      ],
       "properties": {
         "task": {
           "type": "string",
@@ -193,7 +261,9 @@
     "recipePackage": {
       "type": "object",
       "description": "Reference to a package from the Library to execute",
-      "required": ["package"],
+      "required": [
+        "package"
+      ],
       "properties": {
         "package": {
           "type": "string",
@@ -232,6 +302,30 @@
           "minimum": 0
         }
       }
+    },
+    "prerequisite": {
+      "type": "object",
+      "required": [
+        "check",
+        "command"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What is being checked, in words, for the operator to read."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command run on the target machine; exit 0 means the condition holds."
+        },
+        "failureMessage": {
+          "type": "string",
+          "description": "What to say when it does not hold. Falls back to the check text."
+        }
+      }
     }
   },
   "examples": [
@@ -248,33 +342,55 @@
       "roles": [
         {
           "name": "jump-host",
-          "infrastructureIds": ["jump-host-1"],
-          "items": [{ "task": "com.nebulify.bigbang/setup-jump-host/1.0" }]
+          "infrastructureIds": [
+            "jump-host-1"
+          ],
+          "items": [
+            {
+              "task": "com.nebulify.bigbang/setup-jump-host/1.0"
+            }
+          ]
         },
         {
           "name": "master",
-          "infrastructureIds": ["k8s-master-1"],
+          "infrastructureIds": [
+            "k8s-master-1"
+          ],
           "items": [
-            { "task": "com.nebulify.bigbang/update-debian-system/1.0" },
+            {
+              "task": "com.nebulify.bigbang/update-debian-system/1.0"
+            },
             {
               "package": "com.nebulify.bigbang/kubernetes-cluster-setup/1.0.0"
             },
-            { "package": "com.nebulify.bigbang/longhorn-setup/1.0" }
+            {
+              "package": "com.nebulify.bigbang/longhorn-setup/1.0"
+            }
           ]
         },
         {
           "name": "worker",
-          "infrastructureIds": ["k8s-worker-1"],
+          "infrastructureIds": [
+            "k8s-worker-1"
+          ],
           "items": [
-            { "task": "com.nebulify.bigbang/update-debian-system/1.0" },
-            { "package": "com.nebulify.bigbang/longhorn-worker-setup/1.0" }
+            {
+              "task": "com.nebulify.bigbang/update-debian-system/1.0"
+            },
+            {
+              "package": "com.nebulify.bigbang/longhorn-worker-setup/1.0"
+            }
           ]
         },
         {
           "name": "load-balancer",
-          "infrastructureIds": ["load-balancer-1"],
+          "infrastructureIds": [
+            "load-balancer-1"
+          ],
           "items": [
-            { "package": "com.nebulify.bigbang/nginx-load-balancer-stack/1.0" }
+            {
+              "package": "com.nebulify.bigbang/nginx-load-balancer-stack/1.0"
+            }
           ]
         }
       ]
@@ -292,6 +408,9 @@
         "required": true
       }
     ],
-    "uniqueKeys": ["name"]
-  }
+    "uniqueKeys": [
+      "name"
+    ]
+  },
+  "additionalProperties": false
 }

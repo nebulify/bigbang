@@ -39,6 +39,7 @@ pub mod library;
 pub mod profile;
 pub mod recipe;
 pub mod repodb;
+pub mod request;
 pub mod shell;
 pub mod task;
 pub mod vault;
