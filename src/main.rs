@@ -1635,7 +1635,12 @@ fn collect_json(dir: &PathBuf, recursive: bool, out: &mut Vec<PathBuf>) -> Resul
     for entry in std::fs::read_dir(dir)?.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            if recursive {
+            // `resources` holds the files tasks upload, not definitions. A library whose
+            // resources include a .json — a docker daemon.json, a kubernetes manifest —
+            // otherwise had that file installed as a task, which fails with "has no
+            // 'group' field" and makes the whole install exit non-zero. Nothing in there
+            // is ever a definition, so nothing in there is ever a candidate.
+            if recursive && path.file_name().is_some_and(|n| n != "resources") {
                 collect_json(&path, true, out)?;
             }
         } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
@@ -1777,4 +1782,36 @@ fn shell_loop() -> Result<()> {
     }
     println!("bye");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_json_resource_is_not_mistaken_for_a_definition() {
+        // `library install --source tasks -r` walks the tree. `resources/` holds the files
+        // tasks upload; a docker daemon.json or a kubernetes manifest in there was installed
+        // as a task, failed with "has no 'group' field", and took the whole install's exit
+        // code with it — a library carrying one could never install cleanly.
+        let root = std::env::temp_dir().join(format!("bb-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("resources/deploy-test-static-site")).unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("install-haproxy.json"), "{}").unwrap();
+        std::fs::write(root.join("nested/setup-nginx.json"), "{}").unwrap();
+        std::fs::write(root.join("resources/deploy-test-static-site/daemon.json"), "{}").unwrap();
+
+        let mut found = Vec::new();
+        collect_json(&root, true, &mut found).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"install-haproxy.json".to_string()));
+        assert!(names.contains(&"setup-nginx.json".to_string()), "other directories are still walked");
+        assert!(!names.contains(&"daemon.json".to_string()), "nothing under resources/ is a definition");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
