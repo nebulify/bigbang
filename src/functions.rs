@@ -103,7 +103,9 @@ fn upload_template(
             rendered.len()
         );
     }
-    let result = executor.run(&wrapped, 120)?;
+    // The payload is in this command line; the line above already said what is
+    // being uploaded and how big it is.
+    let result = executor.run_unechoed(&wrapped, 120)?;
     if !result.success() {
         bail!(
             "uploading {} to {remote_path} failed (exit {}): {}",
@@ -183,7 +185,7 @@ fn upload_file(
         } else {
             format!("printf '%s' '{piece}' {redirect} '{staging}.b64'")
         };
-        let result = executor.run(&wrap_command(&script, run_as, variables), 300)?;
+        let result = executor.run_unechoed(&wrap_command(&script, run_as, variables), 300)?;
         if !result.success() {
             bail!(
                 "uploading {} to {remote_path} failed while sending (exit {}): {}",
@@ -399,10 +401,18 @@ mod tests {
     struct Recorder {
         seen: Vec<String>,
         code: i32,
+        /// Whether each command was sent down the path that never prints it.
+        unechoed: Vec<bool>,
     }
     impl CommandExecutor for Recorder {
         fn run(&mut self, command: &str, _t: u64) -> Result<CommandResult> {
             self.seen.push(command.to_string());
+            self.unechoed.push(false);
+            Ok(CommandResult { exit_code: self.code, output: String::new() })
+        }
+        fn run_unechoed(&mut self, command: &str, _t: u64) -> Result<CommandResult> {
+            self.seen.push(command.to_string());
+            self.unechoed.push(true);
             Ok(CommandResult { exit_code: self.code, output: String::new() })
         }
     }
@@ -432,6 +442,41 @@ mod tests {
     }
 
     #[test]
+    fn an_uploaded_payload_never_goes_down_the_echoing_path() {
+        // The command line carries the whole file, base64-encoded. `mask` replaces a secret's
+        // literal bytes, and base64 of a file containing a secret does not contain base64 of the
+        // secret — the encoding is not aligned to it — so masking cannot save this one. A
+        // pgbackrest.conf with `repo1-cipher-pass` in it would otherwise be printed, reversibly,
+        // to the console and into the environment's history.
+        let root = std::env::temp_dir().join(format!("bb-unechoed-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("secret.conf"), "repo1-cipher-pass=hunter2-very-secret\n").unwrap();
+
+        let mut rec = Recorder { seen: vec![], code: 0, unechoed: vec![] };
+        run_function(
+            &upload_fn("secret.conf", "/etc/pgbackrest/pgbackrest.conf"),
+            &mut BTreeMap::new(), None, &ctx(&root), &mut rec,
+        )
+        .unwrap();
+
+        assert_eq!(rec.seen.len(), 1);
+        assert_eq!(rec.unechoed, vec![true], "the upload must not be printable");
+        // And the payload really is in there, which is why it must not be printed.
+        let encoded = base64::engine::general_purpose::STANDARD.encode("repo1-cipher-pass=hunter2-very-secret\n");
+        assert!(rec.seen[0].contains(&encoded));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn silencing_one_command_does_not_silence_the_rest_of_the_run() {
+        // The two real executors clear `echo` for the call and put it back. Forgetting the second
+        // half would turn the first upload into a silent run, which is the opposite failure.
+        let mut local = crate::exec::LocalExecutor { echo: true, secrets: vec![] };
+        local.run_unechoed("true", 5).unwrap();
+        assert!(local.echo, "echo must be restored after an unechoed command");
+    }
+
+    #[test]
     fn a_template_is_rendered_and_its_content_survives_the_round_trip() {
         let root = std::env::temp_dir().join(format!("bb-fn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -440,7 +485,7 @@ mod tests {
 
         let mut vars = BTreeMap::new();
         vars.insert("domain".to_string(), "colistor.com".to_string());
-        let mut rec = Recorder { seen: vec![], code: 0 };
+        let mut rec = Recorder { seen: vec![], code: 0, unechoed: vec![] };
 
         run_function(&upload_fn("nginx/site.conf", "/etc/nginx/x.conf"), &mut vars, Some("root"), &ctx(&root), &mut rec)
             .unwrap();
@@ -475,7 +520,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("t.conf"), "x").unwrap();
-        let mut rec = Recorder { seen: vec![], code: 1 };
+        let mut rec = Recorder { seen: vec![], code: 1, unechoed: vec![] };
         let err = run_function(&upload_fn("t.conf", "/etc/t"), &mut BTreeMap::new(), None, &ctx(&root), &mut rec)
             .unwrap_err();
         assert!(format!("{err:#}").contains("failed"), "{err:#}");
@@ -485,7 +530,7 @@ mod tests {
     #[test]
     fn a_missing_template_names_the_path_it_looked_for() {
         let root = std::env::temp_dir().join(format!("bb-fn-missing-{}", std::process::id()));
-        let mut rec = Recorder { seen: vec![], code: 0 };
+        let mut rec = Recorder { seen: vec![], code: 0, unechoed: vec![] };
         let err = run_function(&upload_fn("nope.conf", "/etc/t"), &mut BTreeMap::new(), None, &ctx(&root), &mut rec)
             .unwrap_err();
         assert!(format!("{err:#}").contains("nope.conf"), "{err:#}");
@@ -495,7 +540,7 @@ mod tests {
     #[test]
     fn a_template_path_may_not_escape_the_resources_directory() {
         let root = std::env::temp_dir().join("bb-fn-escape");
-        let mut rec = Recorder { seen: vec![], code: 0 };
+        let mut rec = Recorder { seen: vec![], code: 0, unechoed: vec![] };
         let err = run_function(
             &upload_fn("../../../etc/shadow", "/tmp/x"),
             &mut BTreeMap::new(), None, &ctx(&root), &mut rec,
@@ -542,7 +587,7 @@ mod tests {
                 ("sshKeyId", "vault:colistor/colistor-int/colistor-int-ssh-key"),
                 ("selectors", "database-server, vps , int"),
             ]),
-            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
         )
         .unwrap();
 
@@ -576,7 +621,7 @@ mod tests {
                 ("publicIpAddress", "203.0.113.7"), ("sshUsername", "debian"),
                 ("sshKeyName", "colistor-int-ssh-key"),
             ]),
-            &mut BTreeMap::new(), None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+            &mut BTreeMap::new(), None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
         )
         .unwrap();
 
@@ -611,7 +656,7 @@ mod tests {
                 ("sshUsername", "debian"),
                 ("sshKeyId", "file:/k"),
             ]),
-            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("half-built"), "{err:#}");
@@ -633,7 +678,7 @@ mod tests {
                     ("name", "int-base-1"), ("projectId", "proj-1"),
                     ("publicIpAddress", address), ("sshUsername", "debian"), ("sshKeyId", "file:/k"),
                 ]),
-                &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+                &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
             )
             .unwrap();
         }
@@ -658,18 +703,18 @@ mod tests {
                 ("name", "doomed"), ("projectId", "proj-1"),
                 ("publicIpAddress", "203.0.113.7"), ("sshUsername", "debian"), ("sshKeyId", "file:/k"),
             ]),
-            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 },
+            &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
         )
         .unwrap();
         assert_eq!(crate::infra::load_instances(&store).unwrap().len(), 1);
 
         let mut dereg = register_fn(&[("name", "doomed")]);
         dereg.function = "deregisterInstance".into();
-        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 }).unwrap();
+        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] }).unwrap();
         assert!(crate::infra::load_instances(&store).unwrap().is_empty(), "the ghost survived");
 
         // Deregistering something absent is not an error: destroy runs after a failed provision too.
-        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0 }).unwrap();
+        run_function(&dereg, &mut vars, None, &ctx, &mut Recorder { seen: vec![], code: 0, unechoed: vec![] }).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -678,7 +723,7 @@ mod tests {
         let err = run_function(
             &register_fn(&[("name", "x"), ("projectId", "p"), ("publicIpAddress", "1.2.3.4")]),
             &mut BTreeMap::new(), None, &ctx(Path::new("/tmp")),
-            &mut Recorder { seen: vec![], code: 0 },
+            &mut Recorder { seen: vec![], code: 0, unechoed: vec![] },
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("needs a store"), "{err:#}");
@@ -690,7 +735,7 @@ mod tests {
             function: "doTheThing".into(), name: None, description: None,
             params: BTreeMap::new(), output_variable: None,
         };
-        let mut rec = Recorder { seen: vec![], code: 0 };
+        let mut rec = Recorder { seen: vec![], code: 0, unechoed: vec![] };
         let err = run_function(&f, &mut BTreeMap::new(), None, &ctx(Path::new("/tmp")), &mut rec).unwrap_err();
         assert!(format!("{err:#}").contains("unknown function"), "{err:#}");
     }
@@ -708,7 +753,7 @@ mod tests {
         };
         // No vault configured, so this also proves the vault check happens — but the placeholder
         // check must be the thing that fires when a vault *is* present, so assert on both paths.
-        let err = run_function(&f, &mut BTreeMap::new(), None, &ctx(Path::new("/tmp")), &mut Recorder { seen: vec![], code: 0 })
+        let err = run_function(&f, &mut BTreeMap::new(), None, &ctx(Path::new("/tmp")), &mut Recorder { seen: vec![], code: 0, unechoed: vec![] })
             .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("vault"), "{text}");
@@ -815,7 +860,7 @@ mod tests {
         let f = upload_file_fn("blob.bin", remote.to_str().unwrap());
         let mut vars = BTreeMap::new();
         // A recorder that fails every command: nothing reaches the far side.
-        let mut broken = Recorder { seen: Vec::new(), code: 1 };
+        let mut broken = Recorder { seen: Vec::new(), code: 1, unechoed: Vec::new() };
         let err = run_function(&f, &mut vars, None, &ctx(&root), &mut broken).unwrap_err();
         assert!(format!("{err:#}").contains("failed"), "{err:#}");
         assert!(!remote.exists(), "a failed upload must leave no file at the target name");
@@ -875,7 +920,7 @@ mod tests {
             name: None, description: None, params, output_variable: None,
         };
         let mut vars = BTreeMap::new();
-        let err = run_function(&f, &mut vars, None, &ctx(&root), &mut Recorder { seen: vec![], code: 0 })
+        let err = run_function(&f, &mut vars, None, &ctx(&root), &mut Recorder { seen: vec![], code: 0, unechoed: vec![] })
             .unwrap_err();
         assert!(format!("{err:#}").contains("uploadWhatever"));
         let _ = std::fs::remove_dir_all(&root);

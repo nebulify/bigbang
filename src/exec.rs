@@ -84,6 +84,21 @@ impl CommandResult {
 
 pub trait CommandExecutor {
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult>;
+
+    /// Run a command whose *text* must never be printed, however this executor is configured.
+    ///
+    /// An upload carries the whole file, base64-encoded, in its command line, and `mask` cannot
+    /// help there: it replaces a secret's literal bytes, and the base64 of a file that contains a
+    /// secret does not contain the base64 of the secret — the encoding is not aligned to it. So a
+    /// pgbackrest.conf holding `repo1-cipher-pass` would be printed, reversibly, to the console
+    /// and into the environment's history.
+    ///
+    /// The default is `run`, which is right for a recording executor in a test; the two real ones
+    /// override it. Output is still shown and still masked: it is the payload that is silenced,
+    /// not the result.
+    fn run_unechoed(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
+        self.run(command, timeout_secs)
+    }
 }
 
 /// Where a command is sent.
@@ -239,6 +254,13 @@ impl SshExecutor {
 }
 
 impl CommandExecutor for SshExecutor {
+    fn run_unechoed(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
+        let echo = std::mem::replace(&mut self.echo, false);
+        let result = self.run(command, timeout_secs);
+        self.echo = echo;
+        result
+    }
+
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[SSH] -> {}@{}:{}", self.target.user, self.target.host, self.target.port);
@@ -274,6 +296,13 @@ pub struct LocalExecutor {
 }
 
 impl CommandExecutor for LocalExecutor {
+    fn run_unechoed(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
+        let echo = std::mem::replace(&mut self.echo, false);
+        let result = self.run(command, timeout_secs);
+        self.echo = echo;
+        result
+    }
+
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[local]");
