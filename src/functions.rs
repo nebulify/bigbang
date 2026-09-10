@@ -26,7 +26,19 @@ use crate::vault::Vault;
 /// What the functions need that the command loop does not.
 pub struct FunctionContext<'a> {
     /// Where `templatePath` is resolved from.
+    ///
+    /// The library's own `resources/`. Always present, and always tried last.
     pub resources_root: PathBuf,
+    /// Resource directories supplied for this run, tried before the library's.
+    ///
+    /// A project's built artefact is in the project's repository, not in the shared library:
+    /// `uploadFile` with `path: "web/site.tar.gz"` had nowhere to resolve it from, because the
+    /// only root was the installed library, and nothing in a build puts a tarball there. Every
+    /// static-site deployment needs this, so `recipe execute --resources <dir>` supplies it.
+    ///
+    /// Searched in order, then the library. First match wins, which is also how a project
+    /// overrides a library template without editing the library.
+    pub extra_resource_roots: Vec<PathBuf>,
     /// Absent when the run has no vault configured, which makes `vaultAddItem` a refusal rather
     /// than a silent skip.
     pub vault: Option<&'a Vault>,
@@ -76,7 +88,7 @@ fn upload_template(
         .context("uploadTemplate needs 'remotePath'")?;
     let mode = function.param("mode", variables).unwrap_or_else(|| "0644".to_string());
 
-    let source = resolve_template(&ctx.resources_root, &template_path)?;
+    let source = ctx.resolve_resource(&template_path)?;
     let raw = std::fs::read_to_string(&source)
         .with_context(|| format!("reading template {}", source.display()))?;
     // It is called a template because it is one: the same ${name} substitution the commands get.
@@ -147,7 +159,7 @@ fn upload_file(
         .context("uploadFile needs 'remotePath'")?;
     let mode = function.param("mode", variables).unwrap_or_else(|| "0644".to_string());
 
-    let source = resolve_template(&ctx.resources_root, &path)?;
+    let source = ctx.resolve_resource(&path)?;
     let bytes = std::fs::read(&source)
         .with_context(|| format!("reading {}", source.display()))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -221,7 +233,39 @@ fn upload_file(
     Ok(())
 }
 
-/// `templatePath` is relative to the resources root, and must stay inside it.
+impl FunctionContext<'_> {
+    /// Find a resource by its declared relative path, project roots before the library.
+    ///
+    /// The failure names every directory tried. "template not found: <one path>" sent people
+    /// looking for a typo in the filename when the real answer was that the run had no
+    /// `--resources` and the file was never in the library at all.
+    pub fn resolve_resource(&self, relative: &str) -> Result<PathBuf> {
+        let mut tried = Vec::new();
+        for root in self.extra_resource_roots.iter().chain(std::iter::once(&self.resources_root)) {
+            match resolve_template(root, relative) {
+                Ok(found) => return Ok(found),
+                Err(err) => {
+                    // An escape attempt is a mistake in the definition, not a miss to keep
+                    // searching past: the next root would resolve it to somewhere else entirely.
+                    if err.to_string().contains("must not escape") {
+                        return Err(err);
+                    }
+                    tried.push(root.join(relative));
+                }
+            }
+        }
+        bail!(
+            "resource not found: '{relative}'. Tried:\n{}\nA library resource is installed \
+             alongside the definitions, so one added to the repository has to be installed \
+             before a run can use it. A file built by this project — an archive, a rendered \
+             config — is not in the library at all: pass `--resources <dir>` so the run can \
+             find it where the build left it.",
+            tried.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+        )
+    }
+}
+
+/// `templatePath` is relative to one root, and must stay inside it.
 fn resolve_template(root: &Path, template_path: &str) -> Result<PathBuf> {
     if template_path.contains("..") {
         bail!("templatePath must not escape the resources directory: '{template_path}'");
@@ -420,6 +464,7 @@ mod tests {
     fn ctx(root: &Path) -> FunctionContext<'_> {
         FunctionContext {
             resources_root: root.to_path_buf(),
+            extra_resource_roots: Vec::new(),
             vault: None,
             vault_password: &|| Ok("pw".to_string()),
             store: None,
@@ -439,6 +484,76 @@ mod tests {
             params,
             output_variable: None,
         }
+    }
+
+    #[test]
+    fn a_project_resource_is_found_where_the_build_left_it() {
+        // The case this exists for: an archive built by the project is in the project's
+        // repository. The library is shared, a build has no business writing into it, and
+        // before this the only root was the library — so every static-site deployment
+        // failed at the upload with "template not found".
+        let base = std::env::temp_dir().join(format!("bb-roots-{}", std::process::id()));
+        let (lib, project) = (base.join("library"), base.join("project"));
+        std::fs::create_dir_all(lib.join("shared")).unwrap();
+        std::fs::create_dir_all(project.join("web")).unwrap();
+        std::fs::write(lib.join("shared/ssl.conf"), "from the library").unwrap();
+        std::fs::write(project.join("web/site.tar.gz"), "from the project").unwrap();
+
+        let ctx = FunctionContext {
+            resources_root: lib.clone(),
+            extra_resource_roots: vec![project.clone()],
+            vault: None,
+            vault_password: &|| Ok("pw".to_string()),
+            store: None,
+            echo: false,
+        };
+        assert_eq!(ctx.resolve_resource("web/site.tar.gz").unwrap(), project.join("web/site.tar.gz"));
+        // The library is still searched, so a shared template needs no flag.
+        assert_eq!(ctx.resolve_resource("shared/ssl.conf").unwrap(), lib.join("shared/ssl.conf"));
+
+        // And the failure names every directory tried, rather than sending someone to look
+        // for a typo in a filename that was never going to be found in one place.
+        let err = ctx.resolve_resource("web/missing.tar.gz").unwrap_err().to_string();
+        assert!(err.contains(&project.join("web/missing.tar.gz").display().to_string()), "{err}");
+        assert!(err.contains(&lib.join("web/missing.tar.gz").display().to_string()), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_project_root_shadows_the_library_rather_than_the_other_way_round() {
+        // First match wins, project first: overriding a library template is then a matter of
+        // putting a file of the same name in the project, with no edit to the shared library.
+        let base = std::env::temp_dir().join(format!("bb-shadow-{}", std::process::id()));
+        let (lib, project) = (base.join("library"), base.join("project"));
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(lib.join("site.conf"), "library").unwrap();
+        std::fs::write(project.join("site.conf"), "project").unwrap();
+
+        let ctx = FunctionContext {
+            resources_root: lib, extra_resource_roots: vec![project.clone()],
+            vault: None, vault_password: &|| Ok("pw".to_string()), store: None, echo: false,
+        };
+        let found = ctx.resolve_resource("site.conf").unwrap();
+        assert_eq!(std::fs::read_to_string(found).unwrap(), "project");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_escape_attempt_is_refused_rather_than_tried_against_the_next_root() {
+        // `..` in a path is a mistake in the definition. Carrying on to the next root would
+        // resolve it somewhere else entirely, which is worse than not resolving it at all.
+        let base = std::env::temp_dir().join(format!("bb-escape-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::create_dir_all(base.join("b")).unwrap();
+        let ctx = FunctionContext {
+            resources_root: base.join("b"), extra_resource_roots: vec![base.join("a")],
+            vault: None, vault_password: &|| Ok("pw".to_string()), store: None, echo: false,
+        };
+        let err = ctx.resolve_resource("../etc/passwd").unwrap_err().to_string();
+        assert!(err.contains("must not escape"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -568,7 +683,7 @@ mod tests {
     fn a_provisioned_machine_registers_itself() {
         let (root, store) = store_at("ok");
         let ctx = FunctionContext {
-            resources_root: root.clone(),
+            resources_root: root.clone(), extra_resource_roots: Vec::new(),
             vault: None,
             vault_password: &|| Ok("pw".into()),
             store: Some(&store),
@@ -612,7 +727,7 @@ mod tests {
         let (root, store) = store_at("keyref");
         let vault = Vault::new(root.join("v"), "colistor", "colistor-int");
         let ctx = FunctionContext {
-            resources_root: root.clone(), vault: Some(&vault),
+            resources_root: root.clone(), extra_resource_roots: Vec::new(), vault: Some(&vault),
             vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
         };
         run_function(
@@ -641,7 +756,7 @@ mod tests {
     fn a_machine_with_no_address_is_not_registered() {
         let (root, store) = store_at("noaddr");
         let ctx = FunctionContext {
-            resources_root: root.clone(), vault: None,
+            resources_root: root.clone(), extra_resource_roots: Vec::new(), vault: None,
             vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
         };
         // The capture found nothing, so the variable resolves to empty.
@@ -668,7 +783,7 @@ mod tests {
     fn registering_twice_replaces_rather_than_duplicates() {
         let (root, store) = store_at("twice");
         let ctx = FunctionContext {
-            resources_root: root.clone(), vault: None,
+            resources_root: root.clone(), extra_resource_roots: Vec::new(), vault: None,
             vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
         };
         let mut vars = BTreeMap::new();
@@ -694,7 +809,7 @@ mod tests {
     fn destroying_a_machine_deregisters_it() {
         let (root, store) = store_at("dereg");
         let ctx = FunctionContext {
-            resources_root: root.clone(), vault: None,
+            resources_root: root.clone(), extra_resource_roots: Vec::new(), vault: None,
             vault_password: &|| Ok("pw".into()), store: Some(&store), echo: false,
         };
         let mut vars = BTreeMap::new();

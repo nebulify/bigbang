@@ -280,6 +280,12 @@ enum RecipeOp {
         /// Supply a variable directly: --var name=value. Beats the recipe and the environment.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         vars: Vec<String>,
+        /// A directory of resources for this run, searched before the library's.
+        ///
+        /// For files this project built — an archive, a rendered config. They are not in the
+        /// shared library and a build has no business putting them there. Repeatable.
+        #[arg(long = "resources", value_name = "DIR")]
+        resources: Vec<PathBuf>,
     },
     /// Install recipe files into the store
     Install {
@@ -316,8 +322,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Recipe { operation } => match operation {
             RecipeOp::List { profile } => recipe_list(&profile),
             RecipeOp::Show { id, profile } => recipe_show(&id, &profile),
-            RecipeOp::Execute { id, profile, dry_run, vars } => {
-                recipe_execute(&id, &profile, dry_run, &vars)
+            RecipeOp::Execute { id, profile, dry_run, vars, resources } => {
+                recipe_execute(&id, &profile, dry_run, &vars, &resources)
             }
             RecipeOp::Install { source, profile, recursive, force } => {
                 recipe_install(&source, &profile, recursive, force)
@@ -1222,7 +1228,13 @@ impl Drop for Sessions {
     }
 }
 
-fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -> Result<()> {
+fn recipe_execute(
+    id: &str,
+    profile_ref: &str,
+    dry_run: bool,
+    vars: &[String],
+    resources: &[PathBuf],
+) -> Result<()> {
     use bigbang::exec::{run_definition_with, CommandExecutor, LocalExecutor, SshExecutor};
     use bigbang::infra::{load_instances, resolve_role_targets, resolve_ssh_key, ssh_target_for};
     use bigbang::recipe::{resolve_all, Recipe};
@@ -1260,6 +1272,21 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
     let mut secret_values = resolved.secrets;
     let instances = load_instances(&store)?;
     let library_root = PathBuf::from(Profile::expand(&profile.library_path));
+
+    // A directory that is not there resolves nothing, and the run would fail later at the
+    // upload naming the file rather than the flag. Refuse now, while the message can still
+    // be about the argument that was wrong.
+    let mut resource_roots = Vec::new();
+    for dir in resources {
+        let expanded = PathBuf::from(Profile::expand(&dir.to_string_lossy()));
+        let canonical = expanded.canonicalize().with_context(|| {
+            format!("--resources {}: no such directory", expanded.display())
+        })?;
+        if !canonical.is_dir() {
+            anyhow::bail!("--resources {}: not a directory", canonical.display());
+        }
+        resource_roots.push(canonical);
+    }
 
     // Resolve every role first, and refuse before running anything.
     //
@@ -1524,6 +1551,7 @@ fn recipe_execute(id: &str, profile_ref: &str, dry_run: bool, vars: &[String]) -
                 let function_vault = open_vault(profile_ref).ok();
                 let ctx = bigbang::functions::FunctionContext {
                     resources_root: library_root.join("resources"),
+                    extra_resource_roots: resource_roots.clone(),
                     vault: function_vault.as_ref(),
                     vault_password: &password,
                     // Provisioning registers what it created, into the same store the recipe was
