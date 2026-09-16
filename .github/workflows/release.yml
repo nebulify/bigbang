@@ -1,0 +1,45 @@
+# Publishes bigbang and bb as downloadable binaries on a GitHub Release, so a consumer (a
+# developer's own machine, or another repository's CI — see digital-productivity-tools'
+# .github/workflows/release.yml for the actual motivating case) can fetch a working binary with a
+# plain, unauthenticated request instead of building from source.
+#
+# Triggered by pushing a tag matching v* — a release here is a deliberate act, not a side effect of
+# a normal push to main.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the test suite
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package the binaries
+        run: |
+          mkdir -p dist
+          cp target/release/bigbang dist/bigbang-linux-x86_64
+          cp target/release/bb dist/bb-linux-x86_64
+          chmod +x dist/*
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/bigbang-linux-x86_64 dist/bb-linux-x86_64 \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

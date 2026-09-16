@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/nebulify/bigbang"
 description = "Deployment CLI: recipes, a vault, a task library and profiles over RepoDB"
-license = "Proprietary"
+license = "Apache-2.0"
 
 [[bin]]
 name = "bigbang"
