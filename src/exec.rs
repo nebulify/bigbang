@@ -99,6 +99,22 @@ pub trait CommandExecutor {
     fn run_unechoed(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         self.run(command, timeout_secs)
     }
+
+    /// The values `mask` should replace with `***` wherever this executor's own commands are
+    /// echoed BACK to the operator — not just while running, but afterward too.
+    ///
+    /// Found live: `run_task_with`'s own skip/failure/verification-failure messages render the
+    /// command via `unwrap_for_display` alone, never `mask`, so a task that failed (or was
+    /// skipped) printed its fully-substituted command — secrets included — in the summary line,
+    /// even though the SAME command's live "[SSH] -> ... $" echo a moment earlier was correctly
+    /// masked. A GitHub PAT reached a local log file this way during a real provisioning run,
+    /// confirming this is not a theoretical gap.
+    ///
+    /// Default empty: `Fake`, the test executor, has nothing to mask and no reason to carry a
+    /// secret list around.
+    fn secrets(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Where a command is sent.
@@ -261,6 +277,10 @@ impl CommandExecutor for SshExecutor {
         result
     }
 
+    fn secrets(&self) -> &[String] {
+        &self.secrets
+    }
+
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
         if self.echo {
             println!("[SSH] -> {}@{}:{}", self.target.user, self.target.host, self.target.port);
@@ -301,6 +321,10 @@ impl CommandExecutor for LocalExecutor {
         let result = self.run(command, timeout_secs);
         self.echo = echo;
         result
+    }
+
+    fn secrets(&self) -> &[String] {
+        &self.secrets
     }
 
     fn run(&mut self, command: &str, timeout_secs: u64) -> Result<CommandResult> {
@@ -441,7 +465,7 @@ fn run_task_with(
         let rendered = wrap_command(&substitute(&detail.cmd, variables), task.run_as.as_deref(), variables);
 
         if should_skip(&detail, variables, task.run_as.as_deref(), executor)? {
-            outcome.skipped.push(unwrap_for_display(&rendered));
+            outcome.skipped.push(mask(&unwrap_for_display(&rendered), executor.secrets()));
             continue;
         }
 
@@ -457,22 +481,22 @@ fn run_task_with(
             if let Some(reason) = failed_assertion(&detail, &result.output) {
                 let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
                 if tolerated {
-                    outcome.ran.push(unwrap_for_display(&rendered));
+                    outcome.ran.push(mask(&unwrap_for_display(&rendered), executor.secrets()));
                     continue;
                 }
-                outcome.failed = Some(format!("{}: {reason}", unwrap_for_display(&rendered)));
+                outcome.failed = Some(format!("{}: {reason}", mask(&unwrap_for_display(&rendered), executor.secrets())));
                 return Ok(outcome);
             }
-            outcome.ran.push(unwrap_for_display(&rendered));
+            outcome.ran.push(mask(&unwrap_for_display(&rendered), executor.secrets()));
             continue;
         }
 
         let tolerated = detail.continue_on_error.unwrap_or(task.continue_on_error);
         if tolerated {
-            outcome.ran.push(unwrap_for_display(&rendered));
+            outcome.ran.push(mask(&unwrap_for_display(&rendered), executor.secrets()));
             continue;
         }
-        outcome.failed = Some(format!("{} (exit {})", unwrap_for_display(&rendered), result.exit_code));
+        outcome.failed = Some(format!("{} (exit {})", mask(&unwrap_for_display(&rendered), executor.secrets()), result.exit_code));
         return Ok(outcome);
     }
 
@@ -480,7 +504,7 @@ fn run_task_with(
     for check in &task.verification {
         let rendered = wrap_command(&substitute(check, variables), task.run_as.as_deref(), variables);
         if !executor.run(&rendered, DEFAULT_TIMEOUT_SECS)?.success() {
-            outcome.failed = Some(format!("verification failed: {}", unwrap_for_display(&rendered)));
+            outcome.failed = Some(format!("verification failed: {}", mask(&unwrap_for_display(&rendered), executor.secrets())));
             return Ok(outcome);
         }
     }
@@ -554,14 +578,27 @@ mod tests {
         /// What the next command prints. Assertions read output, so a fake that always returns
         /// nothing cannot exercise them.
         next_output: Option<String>,
+        /// Mirrors SshExecutor/LocalExecutor's own field, so a test can prove `run_task_with`'s
+        /// skip/failure/verification messages are masked exactly like the live echo is.
+        secrets: Vec<String>,
     }
 
     impl Fake {
         fn new(default_code: i32) -> Self {
-            Self { seen: Vec::new(), answers: BTreeMap::new(), default_code, next_output: None }
+            Self {
+                seen: Vec::new(),
+                answers: BTreeMap::new(),
+                default_code,
+                next_output: None,
+                secrets: Vec::new(),
+            }
         }
         fn answer(mut self, command: &str, code: i32) -> Self {
             self.answers.insert(command.to_string(), code);
+            self
+        }
+        fn with_secret(mut self, secret: &str) -> Self {
+            self.secrets.push(secret.to_string());
             self
         }
     }
@@ -572,6 +609,10 @@ mod tests {
             let code = *self.answers.get(command).unwrap_or(&self.default_code);
             let output = self.next_output.clone().unwrap_or_default();
             Ok(CommandResult { exit_code: code, output })
+        }
+
+        fn secrets(&self) -> &[String] {
+            &self.secrets
         }
     }
 
@@ -617,6 +658,61 @@ mod tests {
             fake.seen[0]
         );
         assert!(!fake.seen[0].contains("${"), "no placeholder may survive: {}", fake.seen[0]);
+    }
+
+    /// Found live, 2026-09-16: a task whose command failed printed the fully-substituted
+    /// command -- secret included -- in its OWN failure message, even though the executor's
+    /// live "$ ..." echo of that exact command was correctly masked a moment earlier. A GitHub
+    /// PAT reached a local log file this way during a real provisioning run. Sabotage-verified:
+    /// reverting the `mask(...)` wrapper back to a bare `unwrap_for_display(&rendered)` in
+    /// `run_task_with`'s exit-code-failure branch turns this red.
+    #[test]
+    fn a_failed_commands_own_failure_message_is_masked_like_its_live_echo_is() {
+        let secret = "ghp_totallyRealLookingToken1234567890";
+        let command = format!("echo \"{secret}\" | gh auth login --with-token");
+        let definition = crate::task::TaskDefinition {
+            group: None, name: "d".into(), version: None, description: None,
+            variables: BTreeMap::new(), environment: BTreeMap::new(), selectors: vec![],
+            tasks: vec![task(vec![TaskCommand::Simple(command.clone())])],
+            type_: None, single_session: None, extra: BTreeMap::new(),
+        };
+
+        let mut fake = Fake::new(1).with_secret(secret); // exit 1: every command "fails"
+        let outcomes = run_definition(&definition, &BTreeMap::new(), &mut fake).unwrap();
+
+        let failed = outcomes[0].failed.as_deref().expect("the command was made to fail");
+        assert!(!failed.contains(secret), "the secret leaked into the failure message: {failed}");
+        assert!(failed.contains("***"), "expected the masked placeholder, got: {failed}");
+    }
+
+    /// Same defect, the OTHER place it hides: a task that is SKIPPED (its `skipIf` held) still
+    /// renders the would-have-run command into `outcome.skipped` via the same unmasked path.
+    #[test]
+    fn a_skipped_commands_own_message_is_masked_too() {
+        let secret = "sk-ant-totallyRealLookingKey1234567890";
+        let command = format!("printf '%s' \"{secret}\" > /tmp/x");
+        let definition = crate::task::TaskDefinition {
+            group: None, name: "d".into(), version: None, description: None,
+            variables: BTreeMap::new(), environment: BTreeMap::new(), selectors: vec![],
+            tasks: vec![Task {
+                name: "t".into(), description: None, run_as: None,
+                commands: vec![TaskCommand::Detailed(DetailedCommand {
+                    cmd: command,
+                    skip_if: Some("true".into()),
+                    ..Default::default()
+                })],
+                continue_on_error: false, verification: vec![], condition: None,
+                functions: vec![], extra: BTreeMap::new(),
+            }],
+            type_: None, single_session: None, extra: BTreeMap::new(),
+        };
+
+        let mut fake = Fake::new(0).with_secret(secret);
+        let outcomes = run_definition(&definition, &BTreeMap::new(), &mut fake).unwrap();
+
+        let skipped = &outcomes[0].skipped[0];
+        assert!(!skipped.contains(secret), "the secret leaked into the skip message: {skipped}");
+        assert!(skipped.contains("***"), "expected the masked placeholder, got: {skipped}");
     }
 
     /// The caller's layer must still win, and carry the nested value with it.
