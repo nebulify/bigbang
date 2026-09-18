@@ -260,8 +260,26 @@ impl SshExecutor {
             args.push("ControlPersist=30".into());
         }
         if let Some(jump) = &self.target.jump {
-            args.push("-J".into());
-            args.push(jump.clone());
+            // Not a bare -J: found live that OpenSSH does not reliably apply this same command's
+            // own -i/IdentitiesOnly to the jump hop itself. The operator's own SSH agent held
+            // several unrelated keys (from other hosts worked on the same day), and with a plain
+            // `-J user@host`, the jump connection consulted the agent anyway -- offering enough
+            // keys to hit the jump host's own MaxAuthTries and disconnect with "Too many
+            // authentication failures" before the one key actually configured for this run was
+            // ever tried. An explicit ProxyCommand leaves no ambiguity for OpenSSH to resolve
+            // differently: the jump hop gets exactly the same StrictHostKeyChecking,
+            // UserKnownHostsFile and IdentitiesOnly/-i restriction as the final hop.
+            let (jump_host, jump_port) = match jump.rsplit_once(':') {
+                Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                    (h.to_string(), p.to_string())
+                }
+                _ => (jump.clone(), "22".to_string()),
+            };
+            args.push("-o".into());
+            args.push(format!(
+                "ProxyCommand=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i {} -p {} -W %h:%p {}",
+                self.target.key_path, jump_port, jump_host
+            ));
         }
         args.push(format!("{}@{}", self.target.user, self.target.host));
         args.push(command.to_string());
@@ -999,12 +1017,62 @@ mod tests {
         let argv = ssh.argv("uptime");
         assert_eq!(argv[argv.len() - 2], "debian@10.1.1.75");
         assert_eq!(argv[argv.len() - 1], "uptime");
-        assert!(argv.windows(2).any(|w| w[0] == "-J" && w[1] == "debian@57.129.31.14"));
         assert!(argv.windows(2).any(|w| w[0] == "-i" && w[1] == "/k/id"));
         assert!(argv.contains(&"StrictHostKeyChecking=no".to_string()));
         // Without singleSession there is no multiplexing, and the flags are
         // exactly what they always were.
         assert!(!argv.iter().any(|a| a.starts_with("ControlPath")));
+    }
+
+    #[test]
+    fn the_jump_hop_gets_its_own_identity_restriction_too() {
+        // Found live: a bare `-J user@host` let the operator's own SSH agent (holding several
+        // unrelated keys from other hosts worked on the same day) get consulted for the JUMP
+        // connection specifically, hitting the jump host's own MaxAuthTries and disconnecting
+        // with "Too many authentication failures" before the one key actually configured for
+        // this run was ever offered -- even though the final hop's own -i/IdentitiesOnly was
+        // correct all along. This reproduces the shape that broke: a plain -J with no per-hop
+        // ProxyCommand is exactly the failure mode.
+        let ssh = SshExecutor {
+            target: SshTarget {
+                host: "10.1.1.75".into(), port: 22, user: "debian".into(),
+                key_path: "/k/id".into(), jump: Some("debian@57.129.31.14".into()),
+            },
+            echo: false,
+            secrets: Vec::new(),
+            control_path: None,
+        };
+        let argv = ssh.argv("uptime");
+        assert!(
+            !argv.contains(&"-J".to_string()),
+            "a bare -J does not reliably restrict the jump hop's own identity: {argv:?}"
+        );
+        let proxy_command = argv
+            .iter()
+            .find(|a| a.starts_with("ProxyCommand="))
+            .unwrap_or_else(|| panic!("no ProxyCommand in {argv:?}"));
+        assert!(proxy_command.contains("-i /k/id"), "{proxy_command}");
+        assert!(proxy_command.contains("IdentitiesOnly=yes"), "{proxy_command}");
+        assert!(proxy_command.contains("debian@57.129.31.14"), "{proxy_command}");
+        assert!(proxy_command.contains("-W %h:%p"), "{proxy_command}");
+    }
+
+    #[test]
+    fn a_jump_hosts_explicit_port_is_used_for_the_jump_hop_not_the_final_target() {
+        let ssh = SshExecutor {
+            target: SshTarget {
+                host: "10.1.1.75".into(), port: 22, user: "debian".into(),
+                key_path: "/k/id".into(), jump: Some("debian@57.129.31.14:2222".into()),
+            },
+            echo: false,
+            secrets: Vec::new(),
+            control_path: None,
+        };
+        let argv = ssh.argv("uptime");
+        let proxy_command = argv.iter().find(|a| a.starts_with("ProxyCommand=")).unwrap();
+        assert!(proxy_command.contains("-p 2222"), "{proxy_command}");
+        assert!(proxy_command.contains("debian@57.129.31.14"), "{proxy_command}");
+        assert!(!proxy_command.contains("57.129.31.14:2222"), "{proxy_command}");
     }
 
     #[test]
