@@ -1443,6 +1443,19 @@ fn recipe_execute(
                         p.check
                     );
                     if !ok {
+                        // Found live: a prerequisite failing here looked identical whether the
+                        // check genuinely evaluated false (real host state) or ssh itself never
+                        // connected at all (auth failure, timeout, network) -- exit_code alone
+                        // does not distinguish "1" from "255", and the actual ssh output (which
+                        // would say which one) was captured and then silently thrown away. Three
+                        // unrelated checks (memory, disk, OS) all failing at once on a host
+                        // already proven reachable was the exact shape this produced -- an
+                        // operator staring at "needs 512 MB" for a host with 4 GB, unable to tell
+                        // that ssh, not the host, was the actual problem.
+                        if !result.output.trim().is_empty() {
+                            let shown = bigbang::exec::mask(result.output.trim(), probe.secrets());
+                            println!("      {}", shown.replace('\n', "\n      "));
+                        }
                         complaints.push(p.complaint(&instance.name));
                     }
                 }
