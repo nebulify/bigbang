@@ -1434,13 +1434,35 @@ fn recipe_execute(
                     Box::new(ex)
                 };
                 for p in &all_prerequisites {
-                    let result = probe.run(&p.command, 60)?;
+                    // Up to 3 attempts, 2s apart. Safe to retry blindly here in a way it would
+                    // not be for a task command: a prerequisite is always a read-only shell test
+                    // (free, df, grep) with no side effect to double up on, never a mutation --
+                    // unlike the retry that once turned one bad photo upload into a permanent
+                    // loop, there is nothing here for a retry to repeat that matters.
+                    //
+                    // Added after finding a real, unexplained intermittent failure: one specific
+                    // CI environment's ssh process closing its own connection to a jump host
+                    // mid-authentication, consistently, on a host independently proven reachable
+                    // and correctly configured moments apart from the same environment. Neither a
+                    // jump-hop identity bug nor the jump host's own connection-flood defenses
+                    // explained it (both investigated and ruled out or fixed on their own
+                    // merits) -- this does not fix the root cause, it works around it the way any
+                    // unexplained transient network failure gets worked around.
+                    const ATTEMPTS: u32 = 3;
+                    let mut result = probe.run(&p.command, 60)?;
+                    let mut attempt = 1;
+                    while result.exit_code != 0 && attempt < ATTEMPTS {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        result = probe.run(&p.command, 60)?;
+                    }
                     let ok = result.exit_code == 0;
                     println!(
-                        "  {} {} — {}",
+                        "  {} {} — {}{}",
                         if ok { "✓" } else { "✗" },
                         instance.name,
-                        p.check
+                        p.check,
+                        if attempt > 1 { format!(" (attempt {attempt}/{ATTEMPTS})") } else { String::new() }
                     );
                     if !ok {
                         // Found live: a prerequisite failing here looked identical whether the
